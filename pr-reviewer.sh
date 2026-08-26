@@ -117,17 +117,18 @@ parse_verdict() { # parse_verdict <model-output>
 }
 
 strip_verdict() { # strip_verdict <model-output>
-  local lines verdict_line
-  lines=$(<<<"$1" wc -l)
-  # Check if the last non-blank line is a verdict line; if so, remove only that line
-  verdict_line=$(grep -v '^[[:space:]]*$' <<<"$1" | tail -n1)
-  if [[ $verdict_line =~ ^[[:space:]]*VERDICT: ]]; then
-    # Remove the last line if it's a verdict
-    sed -e '$d' <<<"$1" | sed -e '/./,$!d'
-  else
-    # No verdict line at end, return as-is (but trim trailing blank lines)
+  local last_line last_line_num
+  # Find the last non-blank line
+  last_line=$(grep -v '^[[:space:]]*$' <<<"$1" | tail -n1)
+  # If it's not a verdict line, return as-is with trailing blanks trimmed
+  if [[ ! $last_line =~ ^[[:space:]]*VERDICT: ]]; then
     sed -e '/./,$!d' <<<"$1"
+    return 0
   fi
+  # It is a verdict line; find its line number in the original output
+  last_line_num=$(grep -nv '^[[:space:]]*$' <<<"$1" | tail -n1 | cut -d: -f1)
+  # Delete that specific line and trim trailing blanks
+  sed -e "${last_line_num}d" <<<"$1" | sed -e '/./,$!d'
 }
 
 # Flags are load-bearing: --strict-mcp-config removes the MCP surface (Gmail,

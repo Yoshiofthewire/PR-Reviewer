@@ -184,6 +184,7 @@ eq "three PRs survive the filter" 3 "$(wc -l <<<"$OUT")"
 eq "newest updatedAt sorts first" 'yoshi/beta' "$(head -1 <<<"$OUT" | cut -f1)"
 eq "oldest updatedAt sorts last" 'yoshi/alpha' "$(tail -1 <<<"$OUT" | cut -f1)"
 
+# shellcheck disable=SC2034  # REPOSITORIES, EXCLUDE_REPOSITORIES, MAX_PRS_PER_TICK used by discover_prs
 REPOSITORIES="" EXCLUDE_REPOSITORIES="" MAX_PRS_PER_TICK=2
 CAPPED=$(discover_prs 2>"$STUB/err")
 eq "cap limits the batch" 2 "$(wc -l <<<"$CAPPED")"
@@ -269,6 +270,24 @@ VERDICT: CLEARED')"
 eq "strip_verdict removes final verdict line" 'All prior findings resolved.' \
   "$(strip_verdict 'All prior findings resolved.
 VERDICT: CLEARED')"
+
+# strip_verdict with trailing blank lines must not leak the verdict
+RESULT=$(strip_verdict 'All good.
+VERDICT: CLEARED
+
+')
+lacks "strip_verdict removes verdict followed by blank lines" "$RESULT" 'VERDICT:'
+
+RESULT2=$(strip_verdict 'All good.
+VERDICT: CHANGES_REQUIRED
+   ')
+lacks "strip_verdict removes verdict followed by whitespace line" "$RESULT2" 'VERDICT:'
+
+# Non-verdict last line returns unchanged
+UNCHANGED=$(strip_verdict 'VERDICT: CLEARED in the middle
+All good.')
+eq "strip_verdict leaves non-verdict last line unchanged" 'VERDICT: CLEARED in the middle
+All good.' "$UNCHANGED"
 
 # --- run_persona uses the hardened invocation (claude is stubbed) ---
 cat >"$STUB/bin/claude" <<'STUBEOF'
