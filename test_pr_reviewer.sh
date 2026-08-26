@@ -87,5 +87,38 @@ rc "cleared persona re-reviews after a push" 0 needs_review abc "$T1" def "$T1"
 # First reply ever seen, with no prior seen value recorded.
 rc "first reply with empty seen needs review" 0 needs_review abc "" abc "$T1"
 
+# --- persona table ---
+eq "security uses the security-audit skill" security-audit "${PERSONA_SKILL[security]}"
+eq "simplicity uses the ponytail-review skill" ponytail-review "${PERSONA_SKILL[simplicity]}"
+eq "hostile uses the hostile-review skill" hostile-review "${PERSONA_SKILL[hostile]}"
+eq "three personas are defined" 3 "${#PERSONA_ORDER[@]}"
+
+# --- signature ---
+SIG=$(signature claude-opus-5 security-audit)
+eq "signature matches the required wording" \
+  '*claude-opus-5 using security-audit on behalf of Yoshi*' "$SIG"
+
+# --- render_comment ---
+C=$(render_comment security claude-opus-5 abc123 2026-08-26T09:00:00Z open \
+  '### [P0] Fix the thing
+- Location: `a.sh:1`')
+contains "comment carries its state block" "$C" '<!-- pr-reviewer persona=security head=abc123'
+contains "comment states the verdict in the heading" "$C" '## Security review - changes required'
+contains "comment carries the findings" "$C" '### [P0] Fix the thing'
+contains "comment is signed with model and skill" "$C" \
+  '*claude-opus-5 using security-audit on behalf of Yoshi*'
+
+CLEARED=$(render_comment hostile claude-opus-5 abc123 2026-08-26T09:00:00Z cleared 'Nothing left.')
+contains "cleared comment says cleared" "$CLEARED" '## Hostile review - cleared'
+contains "cleared comment records the verdict in state" "$CLEARED" 'verdict=cleared'
+
+# --- render_summary ---
+S=$(render_summary abc123 2026-08-26T09:00:00Z 2 '- security: cleared
+- simplicity: cleared
+- hostile: changes required')
+contains "summary reports the tally" "$S" '2/3 personas cleared'
+contains "summary is a summary state block" "$S" 'persona=summary'
+contains "summary lists each persona" "$S" '- hostile: changes required'
+
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"
