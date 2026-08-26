@@ -54,7 +54,7 @@ quarantine_instructions() { # quarantine_instructions <dir>
   local dir="$1" name
   for name in "${QUARANTINE_PATHS[@]}"; do
     [[ -e "$dir/$name" ]] || continue
-    rm -rf "$dir/$name.quarantined"
+    rm -rf "$dir/$name.quarantined" || return 1
     mv "$dir/$name" "$dir/$name.quarantined" || return 1
   done
   return 0
@@ -63,6 +63,10 @@ quarantine_instructions() { # quarantine_instructions <dir>
 # Leftovers from a run that was killed before its trap fired.
 reap_stale_checkouts() {
   [[ -d $WORK_DIR ]] || return 0
+  if [[ $(basename "$WORK_DIR") != pr-reviewer ]]; then
+    echo "ERROR: refusing to reap $WORK_DIR (basename must be pr-reviewer)" >&2
+    return 1
+  fi
   rm -rf "${WORK_DIR:?}"/* 2>/dev/null
   return 0
 }
