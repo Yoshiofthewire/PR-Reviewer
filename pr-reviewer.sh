@@ -25,6 +25,14 @@ discover_prs() {
   done
   [[ ${#args[@]} -gt 0 ]] || return 1
 
+  local raw count
+  raw=$(gh search prs --state=open --archived=false "${args[@]}" \
+    --sort updated --order desc --limit 100 \
+    --json repository,number,updatedAt,title,isDraft) || return 1
+  count=$(jq 'length' <<<"$raw") || return 1
+  [[ $count -eq 100 ]] &&
+    echo "WARNING: discovery hit the 100-PR query limit; some open PRs may not have been seen this tick" >&2
+
   while IFS=$'\t' read -r repo number updated title; do
     [[ -n $repo ]] || continue
     repo_allowed "$repo" || continue
@@ -35,12 +43,10 @@ discover_prs() {
     kept=$((kept + 1))
     printf '%s\t%s\t%s\t%s\n' "$repo" "$number" "$updated" "$title"
   done < <(
-    gh search prs --state=open --archived=false "${args[@]}" \
-      --limit 100 --json repository,number,updatedAt,title,isDraft |
-      jq -r 'map(select(.isDraft | not))
-             | sort_by(.updatedAt) | reverse
-             | .[] | [.repository.nameWithOwner, .number, .updatedAt, .title]
-             | @tsv'
+    jq -r 'map(select(.isDraft | not))
+           | sort_by(.updatedAt) | reverse
+           | .[] | [.repository.nameWithOwner, .number, .updatedAt, .title]
+           | @tsv' <<<"$raw"
   )
 }
 
@@ -48,7 +54,7 @@ WORK_DIR="${WORK_DIR:-${XDG_RUNTIME_DIR:-/tmp}/pr-reviewer}"
 
 # Files the CLI would auto-load as instructions. Renamed, not deleted: their real
 # content still needs reviewing, and it stays visible both here and in the diff.
-QUARANTINE_PATHS=(CLAUDE.md AGENTS.md .claude .cursor)
+QUARANTINE_PATHS=(CLAUDE.md AGENTS.md .claude)
 
 quarantine_instructions() { # quarantine_instructions <dir>
   local dir="$1" name
@@ -144,14 +150,17 @@ run_persona() { # run_persona <persona> <dir> <prompt-file>
     claude -p --no-session-persistence --strict-mcp-config --setting-sources user \
       --tools "Skill,Read,Grep,Glob" \
       --model "$CLAUDE_MODEL" --effort "$REASONING_EFFORT" \
-      --system-prompt "$(persona_system_prompt "$persona" "${IS_PUBLIC:-0}")" \
+      --system-prompt "$(persona_system_prompt "$persona" "${IS_PUBLIC:-1}")" \
       <"$abs_prompt"
   )
 }
 
-newest_reply() { # newest_reply <comments-json>
-  jq -r '[.[] | select(.body | contains("<!-- pr-reviewer ") | not) | .updated_at]
-         | max // empty' <<<"$1"
+# Excludes comments by login, not by content: a quoted reply (e.g. GitHub's
+# "Quote reply") copies the state block verbatim into a human's own comment,
+# and matching on content would make that reply invisible forever.
+newest_reply() { # newest_reply <comments-json> <runner-login>
+  jq -r --arg me "$2" \
+    '[.[] | select(.user.login != $me) | .updated_at] | max // empty' <<<"$1"
 }
 
 # The task builder needs reply text, not a timestamp. NO_REPLIES is an epoch
@@ -159,17 +168,22 @@ newest_reply() { # newest_reply <comments-json>
 # a human-readable word like "none" would sort above real ISO timestamps.
 NO_REPLIES=1970-01-01T00:00:00Z
 
-reply_bodies() { # reply_bodies <comments-json> <since-iso8601>
-  jq -r --arg since "${2:-}" \
-    '[.[] | select(.body | contains("<!-- pr-reviewer ") | not)
+reply_bodies() { # reply_bodies <comments-json> <since-iso8601> <runner-login>
+  jq -r --arg since "${2:-}" --arg me "$3" \
+    '[.[] | select(.user.login != $me)
           | select($since == "" or .updated_at > $since)
           | "@" + (.user.login // "someone") + ": " + .body]
      | join("\n\n")' <<<"$1"
 }
 
-persona_comment() { # persona_comment <comments-json> <persona>
-  jq -c --arg p "$2" \
-    'first(.[] | select(.body | contains("<!-- pr-reviewer persona=" + $p + " "))) // empty' \
+# Requires BOTH authorship by the runner AND the marker at the start of the
+# body. Authorship alone would still let the model's own output (which quotes
+# text verbatim) return the wrong persona's comment if it echoes a marker
+# mid-body; startswith alone would trust an attacker-forged state block.
+persona_comment() { # persona_comment <comments-json> <persona> <runner-login>
+  jq -c --arg p "$2" --arg me "$3" \
+    'first(.[] | select(.user.login == $me and
+                         (.body | startswith("<!-- pr-reviewer persona=" + $p + " ")))) // empty' \
     <<<"$1"
 }
 
@@ -189,10 +203,29 @@ upsert_comment() { # upsert_comment <repo> <number> <comment-url> <body-file>
   fi
 }
 
-review_pr() { # review_pr <repo> <number>
-  local repo="$1" number="$2"
+SECURITY_REPORT_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/pr-reviewer"
+
+security_report_path() { # security_report_path <repo> <number> <sha>
+  printf '%s/%s-%s-%s.md' "$SECURITY_REPORT_DIR" "${1//\//-}" "$2" "$3"
+}
+
+# Runs even under DRY_RUN: the operator dry-running still needs the full
+# finding, since the comment (also just printed, not posted) only names
+# severity and file on a public repo.
+write_security_report() { # write_security_report <path> <body>
+  local path="$1" body="$2" dir
+  dir=$(dirname "$path")
+  mkdir -p "$dir" || return 1
+  chmod 700 "$dir" || return 1
+  ( umask 077 && printf '%s\n' "$body" >"$path" ) || return 1
+  chmod 600 "$path" || return 1
+  return 0
+}
+
+review_pr() { # review_pr <repo> <number> <runner-login>
+  local repo="$1" number="$2" runner="$3"
   local head_sha comments newest dir persona pc body_text state_head state_seen
-  local prior url out verdict body cleared=0 lines="" truncated="" rc=0 repo_json
+  local prior url out verdict body stripped report_path cleared=0 lines="" truncated="" rc=0 repo_json
   local -A VERDICTS=()
   local pending=()
 
@@ -200,12 +233,12 @@ review_pr() { # review_pr <repo> <number>
   repo_json=$(gh repo view "$repo" --json isPrivate) || return 1
   IS_PUBLIC=$(visibility_flag "$repo_json")
   comments=$(gh api --paginate "repos/$repo/issues/$number/comments") || return 1
-  newest=$(newest_reply "$comments")
+  newest=$(newest_reply "$comments" "$runner")
 
   # Seed every persona's verdict from what is already posted, so the summary is
   # correct even for personas that do not need re-reviewing this tick.
   for persona in "${PERSONA_ORDER[@]}"; do
-    pc=$(persona_comment "$comments" "$persona")
+    pc=$(persona_comment "$comments" "$persona" "$runner")
     body_text=$(jq -r '.body // ""' <<<"${pc:-null}")
     state_head=$(state_field "$body_text" head)
     state_seen=$(state_field "$body_text" seen)
@@ -225,17 +258,17 @@ review_pr() { # review_pr <repo> <number>
 
   # Scratch files live beside the checkout, never inside it.
   gh pr diff --repo "$repo" "$number" >"$WORK_DIR/diff.full.$$" || return 1
-  head -c "$MAX_DIFF_BYTES" "$WORK_DIR/diff.full.$$" >"$WORK_DIR/diff.$$"
+  head -c "$MAX_DIFF_BYTES" "$WORK_DIR/diff.full.$$" >"$WORK_DIR/diff.$$" || return 1
   [[ $(wc -c <"$WORK_DIR/diff.full.$$") -gt $MAX_DIFF_BYTES ]] &&
     truncated=$'\n\n> Review input was truncated; omitted changes were not reviewed.'
 
   for persona in "${pending[@]}"; do
-    pc=$(persona_comment "$comments" "$persona")
+    pc=$(persona_comment "$comments" "$persona" "$runner")
     prior=$(jq -r '.body // ""' <<<"${pc:-null}")
     url=$(jq -r '.url // empty' <<<"${pc:-null}")
     {
       build_persona_task "$persona" "$prior" \
-        "$(reply_bodies "$comments" "$(state_field "$prior" seen)")"
+        "$(reply_bodies "$comments" "$(state_field "$prior" seen)" "$runner")"
       printf '\nDiff (possibly truncated):\n'
       cat "$WORK_DIR/diff.$$"
     } >"$WORK_DIR/prompt.$$"
@@ -244,7 +277,20 @@ review_pr() { # review_pr <repo> <number>
     [[ -n $out ]] || { echo "ERROR $repo#$number $persona: empty output" >&2; rc=1; continue; }
     verdict=$(parse_verdict "$out")
     VERDICTS[$persona]=$verdict
-    body=$(redact_findings "$persona" "$IS_PUBLIC" "$(strip_verdict "$out")")
+    stripped=$(strip_verdict "$out")
+    if [[ $persona == security && $IS_PUBLIC == 1 ]]; then
+      report_path=$(security_report_path "$repo" "$number" "$head_sha")
+      if write_security_report "$report_path" "$stripped"; then
+        echo "security report for $repo#$number written to $report_path" >&2
+      else
+        echo "ERROR $repo#$number security: failed to write local report to $report_path" >&2
+        report_path=""
+        rc=1
+      fi
+      body=$(redact_findings "$persona" "$IS_PUBLIC" "$stripped" "$report_path")
+    else
+      body=$(redact_findings "$persona" "$IS_PUBLIC" "$stripped")
+    fi
     render_comment "$persona" "$CLAUDE_MODEL" "$head_sha" "${newest:-$NO_REPLIES}" "$verdict" \
       "$body$truncated" >"$WORK_DIR/body.$$"
     upsert_comment "$repo" "$number" "$url" "$WORK_DIR/body.$$" || rc=1
@@ -257,7 +303,7 @@ review_pr() { # review_pr <repo> <number>
     [[ $verdict == cleared ]] && cleared=$((cleared + 1))
     lines+="- $persona: ${verdict:-not yet reviewed}"$'\n'
   done
-  pc=$(persona_comment "$comments" summary)
+  pc=$(persona_comment "$comments" summary "$runner")
   url=$(jq -r '.url // empty' <<<"${pc:-null}")
   render_summary "$head_sha" "${newest:-$NO_REPLIES}" "$cleared" "$lines" >"$WORK_DIR/body.$$"
   upsert_comment "$repo" "$number" "$url" "$WORK_DIR/body.$$" || rc=1
@@ -274,7 +320,13 @@ main() {
   gh auth status >/dev/null 2>&1 ||
     { echo "ERROR: gh is not authenticated; run 'gh auth login'" >&2; exit 1; }
 
-  reap_stale_checkouts
+  # Resolved once per tick, never per PR, and threaded into review_pr so
+  # comment-identity checks compare against it instead of trusting body content.
+  local runner
+  runner=$(gh api user --jq .login) || { echo "ERROR: could not resolve runner login" >&2; exit 1; }
+
+  reap_stale_checkouts ||
+    { echo "ERROR: refusing to proceed; WORK_DIR could not be reaped" >&2; exit 1; }
 
   # Capture discovery output before iterating: a `while ... < <(discover_prs)`
   # process substitution cannot see discover_prs's exit status, so a discovery
@@ -285,7 +337,7 @@ main() {
     while IFS=$'\t' read -r repo number _ _; do
       [[ -n $repo ]] || continue
       # One bad PR must not stop the rest of the tick.
-      review_pr "$repo" "$number" ||
+      review_pr "$repo" "$number" "$runner" ||
         { failures=$((failures + 1)); echo "ERROR $repo#$number" >&2; }
     done <<<"$prs"
   fi
@@ -294,5 +346,14 @@ main() {
 }
 
 if [[ ${BASH_SOURCE[0]:-} == "$0" ]]; then
+  # Serialise every invocation regardless of how it was started (directly or
+  # via the systemd unit), so a concurrent tick cannot reap another tick's
+  # checkout mid-review. Re-exec under flock; a second concurrent run fails
+  # to acquire the lock and exits quietly rather than erroring loudly.
+  if [[ -z ${PR_REVIEWER_LOCKED:-} ]]; then
+    LOCK_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/pr-reviewer.lock"
+    mkdir -p "$(dirname "$LOCK_FILE")" || exit 1
+    exec env PR_REVIEWER_LOCKED=1 flock -n "$LOCK_FILE" "$0" "$@"
+  fi
   main "$@"
 fi

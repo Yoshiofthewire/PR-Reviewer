@@ -82,13 +82,19 @@ visibility_flag() { # visibility_flag <gh repo view --json isPrivate output>
 
 # Publishing an exploitable finding against an unfixed public branch is
 # uncoordinated disclosure, so public security reports name severity and file only.
-redact_findings() { # redact_findings <persona> <is-public 0|1> <body>
-  local persona="$1" public="$2" body="$3" line sev="P?" file
+# <local-report-path> must be the actual path the caller wrote the full finding
+# to, or empty if that write failed; this function performs no I/O itself.
+redact_findings() { # redact_findings <persona> <is-public 0|1> <body> [local-report-path]
+  local persona="$1" public="$2" body="$3" path="${4:-}" line sev="P?" file
   if [[ $persona != security || $public != 1 ]]; then
     printf '%s' "$body"
     return 0
   fi
-  printf 'Detail withheld: this repository is public, and posting an unfixed finding here would be public disclosure. The full report was written to the operator local report file.\n'
+  if [[ -n $path ]]; then
+    printf 'Detail withheld: this repository is public, and posting an unfixed finding here would be public disclosure. The full report was written to `%s`.\n' "$path"
+  else
+    printf 'Detail withheld: this repository is public, and posting an unfixed finding here would be public disclosure. The full report could not be written locally; check the operator logs.\n'
+  fi
   while IFS= read -r line; do
     if [[ $line =~ ^\#\#\#[[:space:]]\[(P[0-9])\] ]]; then
       sev="${BASH_REMATCH[1]}"
