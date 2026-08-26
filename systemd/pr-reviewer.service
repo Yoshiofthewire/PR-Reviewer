@@ -1,0 +1,11 @@
+[Unit]
+Description=Review open pull requests through persona reviewers
+After=network-online.target
+
+[Service]
+Type=oneshot
+# pr-reviewer.sh takes its own flock (self-exec'd), so a slow tick makes the
+# next one skip rather than stack, regardless of how the script is invoked.
+ExecStart=%h/git/PR-Reviewer/pr-reviewer.sh
+WorkingDirectory=%h/git/PR-Reviewer
+Environment=MAX_PRS_PER_TICK=5
