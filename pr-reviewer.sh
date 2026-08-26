@@ -44,6 +44,42 @@ discover_prs() {
   )
 }
 
+WORK_DIR="${WORK_DIR:-${XDG_RUNTIME_DIR:-/tmp}/pr-reviewer}"
+
+# Files the CLI would auto-load as instructions. Renamed, not deleted: their real
+# content still needs reviewing, and it stays visible both here and in the diff.
+QUARANTINE_PATHS=(CLAUDE.md AGENTS.md .claude .cursor)
+
+quarantine_instructions() { # quarantine_instructions <dir>
+  local dir="$1" name
+  for name in "${QUARANTINE_PATHS[@]}"; do
+    [[ -e "$dir/$name" ]] || continue
+    rm -rf "$dir/$name.quarantined"
+    mv "$dir/$name" "$dir/$name.quarantined" || return 1
+  done
+  return 0
+}
+
+# Leftovers from a run that was killed before its trap fired.
+reap_stale_checkouts() {
+  [[ -d $WORK_DIR ]] || return 0
+  rm -rf "${WORK_DIR:?}"/* 2>/dev/null
+  return 0
+}
+
+# refs/pull/<n>/head resolves for fork PRs too, which a branch name would not.
+prepare_checkout() { # prepare_checkout <repo> <number> <dir>
+  local repo="$1" number="$2" dir="$3"
+  mkdir -p "$dir" || return 1
+  git -C "$dir" init -q || return 1
+  git -C "$dir" remote add origin "https://github.com/$repo" || return 1
+  git -C "$dir" -c protocol.version=2 fetch -q --depth=1 origin \
+    "refs/pull/$number/head" || return 1
+  git -C "$dir" checkout -q FETCH_HEAD || return 1
+  quarantine_instructions "$dir" || return 1
+  return 0
+}
+
 main() {
   echo "not yet implemented" >&2
   return 1
