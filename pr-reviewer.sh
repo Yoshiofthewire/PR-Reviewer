@@ -17,8 +17,9 @@ resolve_owners() {
 }
 
 discover_prs() {
-  local owners=() owner args=() kept=0 line repo number updated title
-  mapfile -t owners < <(resolve_owners) || return 1
+  local owners=() owner args=() kept=0 owners_raw repo number updated title
+  owners_raw=$(resolve_owners) || return 1
+  mapfile -t owners <<<"$owners_raw"
   for owner in "${owners[@]}"; do
     [[ -n $owner ]] && args+=(--owner "$owner")
   done

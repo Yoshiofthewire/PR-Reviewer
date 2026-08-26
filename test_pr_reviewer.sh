@@ -152,7 +152,10 @@ cat >"$STUB/bin/gh" <<'STUBEOF'
 #!/usr/bin/env bash
 case "$1 $2" in
   "api user")   echo yoshi ;;
-  "api user/orgs") printf 'orgone\norgtwo\n' ;;
+  "api user/orgs")
+    [[ ${STUB_ORGS_FAIL:-0} -eq 1 ]] && exit 1
+    printf 'orgone\norgtwo\n'
+    ;;
   "search prs")
     cat <<'JSON'
 [
@@ -185,6 +188,8 @@ REPOSITORIES="" EXCLUDE_REPOSITORIES="" MAX_PRS_PER_TICK=2
 CAPPED=$(discover_prs 2>"$STUB/err")
 eq "cap limits the batch" 2 "$(wc -l <<<"$CAPPED")"
 contains "capped PRs are named on stderr" "$(cat "$STUB/err")" 'yoshi/alpha#1'
+
+STUB_ORGS_FAIL=1 rc "discover_prs fails when org lookup fails" 1 discover_prs
 
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"
