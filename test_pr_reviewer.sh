@@ -66,5 +66,26 @@ eq "malformed block yields empty" "" "$(state_field '<!-- pr-reviewer -->' head)
 FIRST=$(state_emit hostile aaa 2026-01-01T00:00:00Z cleared)
 eq "first block wins" aaa "$(state_field "$FIRST"$'\n'"$BLOCK" head)"
 
+# --- needs_review decision table ---
+T1=2026-08-26T09:00:00Z
+T2=2026-08-26T10:00:00Z
+
+rc "never reviewed needs review" 0 needs_review "" "" abc "$T1"
+rc "unchanged head and no reply skips" 1 needs_review abc "$T1" abc "$T1"
+rc "unchanged head and no comments at all skips" 1 needs_review abc "$T1" abc ""
+rc "new head needs review" 0 needs_review abc "$T1" def "$T1"
+rc "newer reply needs review" 0 needs_review abc "$T1" abc "$T2"
+rc "new head and newer reply needs review" 0 needs_review abc "$T1" def "$T2"
+rc "older reply skips" 1 needs_review abc "$T2" abc "$T1"
+
+# An edited reply reuses its comment id but bumps updated_at, so it must retrigger.
+rc "edited reply needs review" 0 needs_review abc "$T1" abc "$T2"
+
+# A cleared persona is only cleared for the head it cleared against.
+rc "cleared persona re-reviews after a push" 0 needs_review abc "$T1" def "$T1"
+
+# First reply ever seen, with no prior seen value recorded.
+rc "first reply with empty seen needs review" 0 needs_review abc "" abc "$T1"
+
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"

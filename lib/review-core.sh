@@ -25,3 +25,14 @@ state_field() { # state_field <comment-body> <field>
   [[ $block =~ $re ]] && printf '%s' "${BASH_REMATCH[1]}"
   return 0
 }
+
+# ISO 8601 UTC timestamps compare correctly as strings.
+needs_review() { # needs_review <state-head> <state-seen> <current-head> <newest-reply>
+  local state_head="$1" state_seen="$2" cur_head="$3" newest="$4"
+  [[ -z $state_head ]] && return 0
+  [[ $state_head != "$cur_head" ]] && return 0
+  [[ -z $newest ]] && return 1
+  [[ -z $state_seen ]] && return 0
+  [[ $newest > $state_seen ]] && return 0
+  return 1
+}
