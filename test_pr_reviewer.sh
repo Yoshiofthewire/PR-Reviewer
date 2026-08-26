@@ -334,5 +334,59 @@ echo 'important data' >"$WORK_DIR/file.txt"
 rc "reap refuses to delete when basename is not pr-reviewer" 1 reap_stale_checkouts
 [[ -e "$WORK_DIR/file.txt" ]] || fail "file must survive refusal to reap"
 
+# --- reply detection ignores the runner's own comments ---
+COMMENTS='[
+ {"id":1,"url":"u1","updated_at":"2026-08-26T09:00:00Z",
+  "body":"<!-- pr-reviewer persona=security head=abc seen=x verdict=open -->\nold"},
+ {"id":2,"url":"u2","updated_at":"2026-08-26T11:00:00Z","body":"author: fixed it"},
+ {"id":3,"url":"u3","updated_at":"2026-08-26T10:00:00Z",
+  "body":"<!-- pr-reviewer persona=hostile head=abc seen=x verdict=open -->\nold"}
+]'
+eq "newest_reply ignores the runner's own comments" \
+  '2026-08-26T11:00:00Z' "$(newest_reply "$COMMENTS")"
+eq "no human comments yields empty" "" "$(newest_reply '[]')"
+
+PC=$(persona_comment "$COMMENTS" security)
+eq "persona_comment finds the right comment" u1 "$(jq -r .url <<<"$PC")"
+eq "persona_comment returns nothing when absent" "" "$(persona_comment "$COMMENTS" simplicity)"
+
+# --- DRY_RUN must not call gh ---
+cat >"$STUB/bin/gh" <<'STUBEOF'
+#!/usr/bin/env bash
+echo "GH WAS CALLED: $*" >>"$STUB_GH_LOG"
+STUBEOF
+chmod +x "$STUB/bin/gh"
+export STUB_GH_LOG="$STUB/gh.log"
+: >"$STUB_GH_LOG"
+
+# reply_bodies must return reply TEXT, and only what is newer than <since>.
+RB=$(reply_bodies "$COMMENTS" "")
+contains "reply_bodies returns the reply text" "$RB" 'author: fixed it'
+lacks "reply_bodies excludes the runner's own comments" "$RB" 'pr-reviewer persona='
+eq "reply_bodies with a later since returns nothing" "" \
+  "$(reply_bodies "$COMMENTS" '2026-08-26T23:00:00Z')"
+eq "reply_bodies from the epoch returns everything" "$RB" \
+  "$(reply_bodies "$COMMENTS" "$NO_REPLIES")"
+
+echo 'body text' >"$STUB/body"
+DRY_RUN=1 upsert_comment yoshi/alpha 1 "" "$STUB/body" >"$STUB/dry.out"
+eq "dry run never calls gh" "" "$(cat "$STUB_GH_LOG")"
+contains "dry run prints the body it would post" "$(cat "$STUB/dry.out")" 'body text'
+
+DRY_RUN="" upsert_comment yoshi/alpha 1 "" "$STUB/body" >/dev/null
+contains "live run posts a new comment" "$(cat "$STUB_GH_LOG")" 'POST'
+: >"$STUB_GH_LOG"
+DRY_RUN="" upsert_comment yoshi/alpha 1 "https://api/comments/9" "$STUB/body" >/dev/null
+contains "live run patches an existing comment" "$(cat "$STUB_GH_LOG")" 'PATCH'
+
+# --- IS_PUBLIC must be exactly 0 or 1 ---
+# redact_findings gates redaction with a literal comparison against "1"; if this
+# ever produced "true"/"false" instead, redaction would silently disable and a
+# security finding could be published on a public repo.
+eq "public repo (isPrivate=false) yields IS_PUBLIC=1" 1 \
+  "$(echo '{"isPrivate":false}' | jq -r 'if .isPrivate then 0 else 1 end')"
+eq "private repo (isPrivate=true) yields IS_PUBLIC=0" 0 \
+  "$(echo '{"isPrivate":true}' | jq -r 'if .isPrivate then 0 else 1 end')"
+
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"

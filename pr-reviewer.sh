@@ -149,9 +149,146 @@ run_persona() { # run_persona <persona> <dir> <prompt-file>
   )
 }
 
+newest_reply() { # newest_reply <comments-json>
+  jq -r '[.[] | select(.body | contains("<!-- pr-reviewer ") | not) | .updated_at]
+         | max // empty' <<<"$1"
+}
+
+# The task builder needs reply text, not a timestamp. NO_REPLIES is an epoch
+# sentinel so a persona that has never seen a reply still compares correctly;
+# a human-readable word like "none" would sort above real ISO timestamps.
+NO_REPLIES=1970-01-01T00:00:00Z
+
+reply_bodies() { # reply_bodies <comments-json> <since-iso8601>
+  jq -r --arg since "${2:-}" \
+    '[.[] | select(.body | contains("<!-- pr-reviewer ") | not)
+          | select($since == "" or .updated_at > $since)
+          | "@" + (.user.login // "someone") + ": " + .body]
+     | join("\n\n")' <<<"$1"
+}
+
+persona_comment() { # persona_comment <comments-json> <persona>
+  jq -c --arg p "$2" \
+    'first(.[] | select(.body | contains("<!-- pr-reviewer persona=" + $p + " "))) // empty' \
+    <<<"$1"
+}
+
+upsert_comment() { # upsert_comment <repo> <number> <comment-url> <body-file>
+  local repo="$1" number="$2" url="$3" file="$4"
+  if [[ -n ${DRY_RUN:-} ]]; then
+    printf -- '--- would post to %s#%s ---\n' "$repo" "$number"
+    cat "$file"
+    return 0
+  fi
+  if [[ -n $url ]]; then
+    jq -n --rawfile body "$file" '{body: $body}' |
+      gh api --method PATCH "$url" --input - --silent || return 1
+  else
+    jq -n --rawfile body "$file" '{body: $body}' |
+      gh api --method POST "repos/$repo/issues/$number/comments" --input - --silent || return 1
+  fi
+}
+
+review_pr() { # review_pr <repo> <number>
+  local repo="$1" number="$2"
+  local head_sha comments newest dir persona pc body_text state_head state_seen
+  local prior url out verdict body cleared=0 lines="" truncated="" rc=0
+  local -A VERDICTS=()
+  local pending=()
+
+  head_sha=$(gh pr view --repo "$repo" "$number" --json headRefOid --jq .headRefOid) || return 1
+  IS_PUBLIC=$(gh repo view "$repo" --json isPrivate --jq 'if .isPrivate then 0 else 1 end') || return 1
+  comments=$(gh api --paginate "repos/$repo/issues/$number/comments") || return 1
+  newest=$(newest_reply "$comments")
+
+  # Seed every persona's verdict from what is already posted, so the summary is
+  # correct even for personas that do not need re-reviewing this tick.
+  for persona in "${PERSONA_ORDER[@]}"; do
+    pc=$(persona_comment "$comments" "$persona")
+    body_text=$(jq -r '.body // ""' <<<"${pc:-null}")
+    state_head=$(state_field "$body_text" head)
+    state_seen=$(state_field "$body_text" seen)
+    VERDICTS[$persona]=$(state_field "$body_text" verdict)
+    needs_review "$state_head" "$state_seen" "$head_sha" "$newest" && pending+=("$persona")
+  done
+  if [[ ${#pending[@]} -eq 0 ]]; then
+    echo "skip $repo#$number: all personas current at ${head_sha:0:8}"
+    return 0
+  fi
+
+  dir="$WORK_DIR/co-$$-$number"
+  mkdir -p "$WORK_DIR" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -rf '$dir' '$WORK_DIR'/*.$$" RETURN
+  prepare_checkout "$repo" "$number" "$dir" || return 1
+
+  # Scratch files live beside the checkout, never inside it.
+  gh pr diff --repo "$repo" "$number" >"$WORK_DIR/diff.full.$$" || return 1
+  head -c "$MAX_DIFF_BYTES" "$WORK_DIR/diff.full.$$" >"$WORK_DIR/diff.$$"
+  [[ $(wc -c <"$WORK_DIR/diff.full.$$") -gt $MAX_DIFF_BYTES ]] &&
+    truncated=$'\n\n> Review input was truncated; omitted changes were not reviewed.'
+
+  for persona in "${pending[@]}"; do
+    pc=$(persona_comment "$comments" "$persona")
+    prior=$(jq -r '.body // ""' <<<"${pc:-null}")
+    url=$(jq -r '.url // empty' <<<"${pc:-null}")
+    {
+      build_persona_task "$persona" "$prior" \
+        "$(reply_bodies "$comments" "$(state_field "$prior" seen)")"
+      printf '\nDiff (possibly truncated):\n'
+      cat "$WORK_DIR/diff.$$"
+    } >"$WORK_DIR/prompt.$$"
+
+    out=$(run_persona "$persona" "$dir" "$WORK_DIR/prompt.$$") || { rc=1; continue; }
+    [[ -n $out ]] || { echo "ERROR $repo#$number $persona: empty output" >&2; rc=1; continue; }
+    verdict=$(parse_verdict "$out")
+    VERDICTS[$persona]=$verdict
+    body=$(redact_findings "$persona" "$IS_PUBLIC" "$(strip_verdict "$out")")
+    render_comment "$persona" "$CLAUDE_MODEL" "$head_sha" "${newest:-$NO_REPLIES}" "$verdict" \
+      "$body$truncated" >"$WORK_DIR/body.$$"
+    upsert_comment "$repo" "$number" "$url" "$WORK_DIR/body.$$" || rc=1
+  done
+
+  # Tally from VERDICTS, not from a re-fetch: under DRY_RUN nothing was posted,
+  # and a re-fetch would report 0/3 every time.
+  for persona in "${PERSONA_ORDER[@]}"; do
+    verdict="${VERDICTS[$persona]}"
+    [[ $verdict == cleared ]] && cleared=$((cleared + 1))
+    lines+="- $persona: ${verdict:-not yet reviewed}"$'\n'
+  done
+  pc=$(persona_comment "$comments" summary)
+  url=$(jq -r '.url // empty' <<<"${pc:-null}")
+  render_summary "$head_sha" "${newest:-$NO_REPLIES}" "$cleared" "$lines" >"$WORK_DIR/body.$$"
+  upsert_comment "$repo" "$number" "$url" "$WORK_DIR/body.$$" || rc=1
+
+  echo "reviewed $repo#$number: $cleared/${#PERSONA_ORDER[@]} cleared"
+  return $rc
+}
+
 main() {
-  echo "not yet implemented" >&2
-  return 1
+  command -v gh >/dev/null || { echo "ERROR: gh is required" >&2; exit 1; }
+  command -v jq >/dev/null || { echo "ERROR: jq is required" >&2; exit 1; }
+  command -v claude >/dev/null || { echo "ERROR: claude is required" >&2; exit 1; }
+  gh auth status >/dev/null 2>&1 ||
+    { echo "ERROR: gh is not authenticated; run 'gh auth login'" >&2; exit 1; }
+
+  reap_stale_checkouts
+
+  # Capture discovery output before iterating: a `while ... < <(discover_prs)`
+  # process substitution cannot see discover_prs's exit status, so a discovery
+  # failure would silently loop zero times and exit 0 instead of failing loudly.
+  local prs repo number failures=0
+  prs=$(discover_prs) || { echo "ERROR: discovery failed" >&2; exit 1; }
+  if [[ -n $prs ]]; then
+    while IFS=$'\t' read -r repo number _ _; do
+      [[ -n $repo ]] || continue
+      # One bad PR must not stop the rest of the tick.
+      review_pr "$repo" "$number" ||
+        { failures=$((failures + 1)); echo "ERROR $repo#$number" >&2; }
+    done <<<"$prs"
+  fi
+
+  [[ $failures -eq 0 ]] || { echo "$failures pull request(s) failed" >&2; exit 1; }
 }
 
 if [[ ${BASH_SOURCE[0]:-} == "$0" ]]; then
