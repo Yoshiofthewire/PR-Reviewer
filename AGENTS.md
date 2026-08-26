@@ -36,6 +36,9 @@
 - Sign every comment `<model> using <skill> on behalf of Yoshi`.
 - On public repositories the `security` persona publishes severity and file only.
 - Never review archived repositories or draft pull requests.
+- `WORK_DIR` basename must be exactly `pr-reviewer`; the reaper refuses to delete
+  from directories it cannot confirm are its own, because earlier versions would
+  happily wipe operator files if pointed anywhere broad.
 
 ## Work Guidance
 

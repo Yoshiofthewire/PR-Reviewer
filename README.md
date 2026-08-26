@@ -46,6 +46,7 @@ logs with `journalctl --user -u pr-reviewer.service`.
 | `DRY_RUN` | unset | Print comment bodies instead of posting them |
 | `CLAUDE_MODEL` | `opus` | Model for every persona |
 | `REASONING_EFFORT` | `high` | Effort for every persona |
+| `WORK_DIR` | `$XDG_RUNTIME_DIR/pr-reviewer`, or `/tmp/pr-reviewer` | Throwaway checkout directory; basename must be `pr-reviewer` because the reaper refuses to delete from directories it cannot confirm are its own |
 
 An unchanged pull request costs nothing beyond two API calls; only a changed one
 spends tokens.
