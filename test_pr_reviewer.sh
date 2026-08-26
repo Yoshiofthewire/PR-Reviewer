@@ -216,6 +216,53 @@ eq "real source files are untouched" 'real code' "$(cat "$QDIR/src/main.go")"
 # Quarantine must be idempotent: a re-run over an already-clean tree is a no-op.
 rc "quarantine is idempotent" 0 quarantine_instructions "$QDIR"
 
+# --- system prompt safety wording ---
+SP=$(persona_system_prompt security 1)
+contains "prompt marks repo content untrusted" "$SP" 'untrusted data'
+contains "prompt warns the output is public" "$SP" 'world-readable'
+contains "prompt forbids approving" "$SP" 'never approve'
+
+# --- task construction ---
+FIRST_TASK=$(build_persona_task hostile "" "")
+contains "first review names the skill" "$FIRST_TASK" 'hostile-review'
+lacks "first review has no resolution section" "$FIRST_TASK" 'RESOLVED'
+
+RETASK=$(build_persona_task hostile '### [P1] Old finding' 'author: I fixed it in abc123')
+contains "re-review replays prior findings" "$RETASK" '### [P1] Old finding'
+contains "re-review replays the replies" "$RETASK" 'I fixed it in abc123'
+contains "re-review demands per-finding disposition" "$RETASK" 'RESOLVED'
+contains "re-review allows withdrawal" "$RETASK" 'WITHDRAWN'
+
+# --- verdict parsing ---
+eq "cleared verdict is parsed" cleared "$(parse_verdict 'VERDICT: CLEARED
+All prior findings resolved.')"
+eq "changes verdict is parsed" open "$(parse_verdict 'VERDICT: CHANGES_REQUIRED
+### [P0] Thing')"
+eq "missing verdict defaults to open" open "$(parse_verdict 'rambling with no verdict')"
+eq "verdict line is stripped from the body" 'All prior findings resolved.' \
+  "$(strip_verdict 'VERDICT: CLEARED
+All prior findings resolved.')"
+
+# --- run_persona uses the hardened invocation (claude is stubbed) ---
+cat >"$STUB/bin/claude" <<'STUBEOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$STUB_ARGS"
+echo 'VERDICT: CLEARED'
+echo 'nothing to report'
+STUBEOF
+chmod +x "$STUB/bin/claude"
+export STUB_ARGS="$STUB/claude-args"
+
+echo 'task text' >"$STUB/prompt"
+OUT=$(run_persona hostile "$QDIR" "$STUB/prompt")
+ARGS=$(cat "$STUB_ARGS")
+contains "run_persona output is returned" "$OUT" 'VERDICT: CLEARED'
+contains "invocation pins strict mcp config" "$ARGS" '--strict-mcp-config'
+contains "invocation pins user setting sources" "$ARGS" '--setting-sources'
+contains "invocation restricts tools" "$ARGS" 'Skill,Read,Grep,Glob'
+lacks "invocation must not use safe-mode, which strips skills" "$ARGS" '--safe-mode'
+lacks "invocation must not grant Bash" "$ARGS" 'Bash'
+
 # --- stale checkout reaping ---
 # Normal path: WORK_DIR named pr-reviewer in the basename reaps successfully
 WORK_DIR="$STUB/pr-reviewer"
