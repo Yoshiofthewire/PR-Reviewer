@@ -174,7 +174,8 @@ case "$1 $2" in
  {"repository":{"nameWithOwner":"yoshi/beta"},"number":2,"updatedAt":"2026-08-26T12:00:00Z","title":"Beta","isDraft":false},
  {"repository":{"nameWithOwner":"orgone/gamma"},"number":3,"updatedAt":"2026-08-26T11:00:00Z","title":"Gamma","isDraft":false},
  {"repository":{"nameWithOwner":"yoshi/skipme"},"number":4,"updatedAt":"2026-08-26T13:00:00Z","title":"Skip","isDraft":false},
- {"repository":{"nameWithOwner":"yoshi/wip"},"number":5,"updatedAt":"2026-08-26T14:00:00Z","title":"Work in progress","isDraft":true}
+ {"repository":{"nameWithOwner":"yoshi/wip"},"number":5,"updatedAt":"2026-08-26T14:00:00Z","title":"Work in progress","isDraft":true},
+ {"repository":{"nameWithOwner":"yoshi/alpha"},"number":6,"updatedAt":"2026-08-26T09:00:00Z","title":"chore(deps): bump alpine","isDraft":false,"author":{"login":"dependabot[bot]","type":"Bot"}}
 ]
 JSON
     ;;
@@ -208,7 +209,7 @@ STUB_ORGS_FAIL=1 rc "discover_prs fails when org lookup fails" 1 discover_prs
 eq "filter reason names the denylist" 'excluded by EXCLUDE_REPOSITORIES' \
   "$(EXCLUDE_REPOSITORIES=me/x repo_filter_reason me/x)"
 eq "filter reason names the allowlist" 'not in REPOSITORIES allowlist' \
-  "$(REPOSITORIES=me/other EXCLUDE_REPOSITORIES= repo_filter_reason me/x)"
+  "$(REPOSITORIES=me/other EXCLUDE_REPOSITORIES='' repo_filter_reason me/x)"
 
 REPOSITORIES="" EXCLUDE_REPOSITORIES="yoshi/skipme" MAX_PRS_PER_TICK=10
 DROPPED=$(discover_prs 2>&1 >/dev/null)
@@ -224,6 +225,46 @@ contains "discovery reports a tally" "$DROPPED" 'to review'
 MAX_PRS_PER_TICK=1
 CAPMSG=$(discover_prs 2>&1 >/dev/null)
 contains "a deferred PR says the cap is why" "$CAPMSG" 'per-tick cap of 1 reached'
+
+# --- bot-authored PRs (dependabot et al) are skipped by default ---
+REPOSITORIES="" EXCLUDE_REPOSITORIES="" MAX_PRS_PER_TICK=10 REVIEW_BOT_PRS=""
+BOTOUT=$(discover_prs 2>/dev/null)
+BOTLOG=$(discover_prs 2>&1 >/dev/null)
+lacks "a bot-authored PR never reaches the review queue" "$BOTOUT" 'alpha	6'
+contains "a bot-authored PR is named when skipped" "$BOTLOG" 'yoshi/alpha#6'
+contains "the skip names the bot author" "$BOTLOG" 'dependabot[bot]'
+contains "the skip says how to opt back in" "$BOTLOG" 'REVIEW_BOT_PRS=1'
+contains "a human-authored PR is unaffected" "$BOTOUT" 'yoshi/beta'
+
+# shellcheck disable=SC2034  # REVIEW_BOT_PRS is read by discover_prs
+REVIEW_BOT_PRS=1
+OPTIN=$(discover_prs 2>/dev/null)
+contains "REVIEW_BOT_PRS=1 puts bot PRs back in the queue" "$OPTIN" 'yoshi/alpha	6'
+# shellcheck disable=SC2034  # read by discover_prs
+REVIEW_BOT_PRS=""
+
+# --- the CLI's startup chatter must not reach the tick log on success ---
+cat >"$STUB/bin/claude" <<'STUBEOF'
+#!/usr/bin/env bash
+echo 'Permission allow rule (settings.json): noisy warning that repeats every run' >&2
+echo 'another line of startup chatter' >&2
+[[ ${STUB_CLAUDE_FAIL:-0} -eq 1 ]] && exit 1
+echo 'VERDICT: CLEARED'
+STUBEOF
+chmod +x "$STUB/bin/claude"
+echo 'task' >"$STUB/quietprompt"
+
+QUIET_ERR=$(run_persona hostile "$STUB" "$STUB/quietprompt" 2>&1 >/dev/null)
+eq "a successful persona run emits nothing on stderr" "" "$QUIET_ERR"
+
+LOUD_ERR=$(STUB_CLAUDE_FAIL=1 run_persona hostile "$STUB" "$STUB/quietprompt" 2>&1 >/dev/null)
+contains "a failed persona run surfaces the stderr it swallowed" "$LOUD_ERR" 'noisy warning'
+contains "a failed persona run labels whose stderr it is" "$LOUD_ERR" 'hostile'
+export STUB_CLAUDE_FAIL=1
+run_persona hostile "$STUB" "$STUB/quietprompt" >/dev/null 2>&1
+FAILRC=$?
+unset STUB_CLAUDE_FAIL
+eq "a failed persona run propagates non-zero" 1 "$FAILRC"
 
 # --- discovery must never silently truncate ---
 # gh search prs with no --sort returns 100 by best-match relevance, and

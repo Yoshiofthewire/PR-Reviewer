@@ -34,18 +34,25 @@ discover_prs() {
   local raw count
   raw=$(gh search prs --state=open --archived=false "${args[@]}" \
     --sort updated --order desc --limit 100 \
-    --json repository,number,updatedAt,title,isDraft) || return 1
+    --json repository,number,updatedAt,title,isDraft,author) || return 1
   count=$(jq 'length' <<<"$raw") || return 1
   [[ $count -eq 100 ]] &&
     echo "WARNING: discovery hit the 100-PR query limit; some open PRs may not have been seen this tick" >&2
 
-  # Drafts are filtered here rather than in jq so each one can be named.
-  local draft total=0 deferred=0 skipped=0
-  while IFS=$'\t' read -r repo number updated title draft; do
+  # Drafts and bots are filtered here rather than in jq so each one can be named.
+  local draft author authortype total=0 deferred=0 skipped=0
+  while IFS=$'\t' read -r repo number updated title draft author authortype; do
     [[ -n $repo ]] || continue
     total=$((total + 1))
     if [[ $draft == true ]]; then
       log_pr skip "$repo#$number" 'draft'
+      skipped=$((skipped + 1))
+      continue
+    fi
+    # Dependency bumps cost three persona reviews and tell you nothing.
+    # Keyed on author type, not login, so renovate and *-preview[bot] match too.
+    if [[ $authortype == Bot && -z ${REVIEW_BOT_PRS:-} ]]; then
+      log_pr skip "$repo#$number" "authored by $author (bot; REVIEW_BOT_PRS=1 to include)"
       skipped=$((skipped + 1))
       continue
     fi
@@ -64,7 +71,8 @@ discover_prs() {
     printf '%s\t%s\t%s\t%s\n' "$repo" "$number" "$updated" "$title"
   done < <(
     jq -r 'sort_by(.updatedAt) | reverse
-           | .[] | [.repository.nameWithOwner, .number, .updatedAt, .title, .isDraft]
+           | .[] | [.repository.nameWithOwner, .number, .updatedAt, .title, .isDraft,
+                    (.author.login // "unknown"), (.author.type // "User")]
            | @tsv' <<<"$raw"
   )
   printf '\n  %s open · %s to review · %s deferred · %s skipped\n\n' \
@@ -163,9 +171,13 @@ strip_verdict() { # strip_verdict <model-output>
 # --setting-sources user stops a CLAUDE.md in the checkout issuing instructions.
 # --safe-mode would remove the skills and must never be added.
 run_persona() { # run_persona <persona> <dir> <prompt-file>
-  local persona="$1" dir="$2" prompt="$3" abs_prompt
+  local persona="$1" dir="$2" prompt="$3" abs_prompt errlog prc
   # Prompt path must be absolute; resolve it before cd-ing into the untrusted checkout.
   abs_prompt=$(cd "$(dirname "$prompt")" && pwd)/$(basename "$prompt") || return 1
+  # The CLI writes startup chatter to stderr (settings warnings and the like) on
+  # every single invocation. Captured here and surfaced only on failure, so a
+  # five-minute timer does not pump the same warnings into the journal forever.
+  errlog=$(mktemp) || return 1
   (
     cd "$dir" || exit 1
     claude -p --no-session-persistence --strict-mcp-config --setting-sources user \
@@ -173,7 +185,14 @@ run_persona() { # run_persona <persona> <dir> <prompt-file>
       --model "$CLAUDE_MODEL" --effort "$REASONING_EFFORT" \
       --system-prompt "$(persona_system_prompt "$persona" "${IS_PUBLIC:-1}")" \
       <"$abs_prompt"
-  )
+  ) 2>"$errlog"
+  prc=$?
+  if [[ $prc -ne 0 ]]; then
+    echo "--- $persona: last 20 stderr lines ---" >&2
+    tail -20 "$errlog" >&2
+  fi
+  rm -f "$errlog"
+  return $prc
 }
 
 # Excludes a comment only when it is BOTH the runner's AND starts with the
@@ -253,6 +272,7 @@ review_pr() { # review_pr <repo> <number> <runner-login>
   local repo="$1" number="$2" runner="$3"
   local head_sha comments newest dir persona pc body_text state_head state_seen
   local prior url out verdict body stripped report_path cleared=0 lines="" truncated="" rc=0 repo_json
+  local t0
   local -A VERDICTS=()
   local pending=()
 
@@ -304,9 +324,23 @@ review_pr() { # review_pr <repo> <number> <runner-login>
       cat "$WORK_DIR/diff.$$"
     } >"$WORK_DIR/prompt.$$"
 
-    out=$(run_persona "$persona" "$dir" "$WORK_DIR/prompt.$$") || { rc=1; continue; }
-    [[ -n $out ]] || { echo "ERROR $repo#$number $persona: empty output" >&2; rc=1; continue; }
+    # Each persona is a multi-minute model call. Announce it before blocking, or
+    # the tick looks hung; report the elapsed time after, so slow ones are visible.
+    t0=$SECONDS
+    log_pr '' "$repo#$number" \
+      "$persona: running ${PERSONA_SKILL[$persona]} ($CLAUDE_MODEL/$REASONING_EFFORT)…"
+    out=$(run_persona "$persona" "$dir" "$WORK_DIR/prompt.$$") || {
+      log_pr '' "$repo#$number" "$persona: FAILED after $((SECONDS - t0))s"
+      rc=1
+      continue
+    }
+    [[ -n $out ]] || {
+      log_pr '' "$repo#$number" "$persona: empty output after $((SECONDS - t0))s"
+      rc=1
+      continue
+    }
     verdict=$(parse_verdict "$out")
+    log_pr '' "$repo#$number" "$persona: $verdict after $((SECONDS - t0))s"
     VERDICTS[$persona]=$verdict
     stripped=$(strip_verdict "$out")
     if [[ $persona == security && $IS_PUBLIC == 1 ]]; then
