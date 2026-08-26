@@ -144,5 +144,47 @@ eq "non-security personas publish in full on public repos" "$FINDING" "$OTHER"
 CLEAN=$(redact_findings security 1 'No findings.')
 contains "redaction of a clean report still explains itself" "$CLEAN" 'withheld'
 
+# --- discovery, filtering, capping (gh is stubbed) ---
+STUB=$(mktemp -d)
+trap 'rm -rf "$STUB"' EXIT
+mkdir -p "$STUB/bin"
+cat >"$STUB/bin/gh" <<'STUBEOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "api user")   echo yoshi ;;
+  "api user/orgs") printf 'orgone\norgtwo\n' ;;
+  "search prs")
+    cat <<'JSON'
+[
+ {"repository":{"nameWithOwner":"yoshi/alpha"},"number":1,"updatedAt":"2026-08-26T10:00:00Z","title":"Alpha","isDraft":false},
+ {"repository":{"nameWithOwner":"yoshi/beta"},"number":2,"updatedAt":"2026-08-26T12:00:00Z","title":"Beta","isDraft":false},
+ {"repository":{"nameWithOwner":"orgone/gamma"},"number":3,"updatedAt":"2026-08-26T11:00:00Z","title":"Gamma","isDraft":false},
+ {"repository":{"nameWithOwner":"yoshi/skipme"},"number":4,"updatedAt":"2026-08-26T13:00:00Z","title":"Skip","isDraft":false}
+]
+JSON
+    ;;
+esac
+STUBEOF
+chmod +x "$STUB/bin/gh"
+PATH="$STUB/bin:$PATH"
+
+# shellcheck source=pr-reviewer.sh
+source ./pr-reviewer.sh
+
+eq "resolve_owners lists the user and every org" \
+  'yoshi orgone orgtwo' "$(resolve_owners | tr '\n' ' ' | sed 's/ $//')"
+
+REPOSITORIES="" EXCLUDE_REPOSITORIES="yoshi/skipme" MAX_PRS_PER_TICK=10
+OUT=$(discover_prs 2>/dev/null)
+lacks "denylisted repo is filtered out" "$OUT" 'skipme'
+eq "three PRs survive the filter" 3 "$(wc -l <<<"$OUT")"
+eq "newest updatedAt sorts first" 'yoshi/beta' "$(head -1 <<<"$OUT" | cut -f1)"
+eq "oldest updatedAt sorts last" 'yoshi/alpha' "$(tail -1 <<<"$OUT" | cut -f1)"
+
+REPOSITORIES="" EXCLUDE_REPOSITORIES="" MAX_PRS_PER_TICK=2
+CAPPED=$(discover_prs 2>"$STUB/err")
+eq "cap limits the batch" 2 "$(wc -l <<<"$CAPPED")"
+contains "capped PRs are named on stderr" "$(cat "$STUB/err")" 'yoshi/alpha#1'
+
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"
