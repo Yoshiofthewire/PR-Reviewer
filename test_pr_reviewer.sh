@@ -434,6 +434,40 @@ eq "a mid-body marker for another persona does not confuse selection" "" \
 eq "the genuine leading marker is still found for its own persona" u6 \
   "$(jq -r .url <<<"$(persona_comment "$MIDBODY" security "$RUNNER")")"
 
+# CRITICAL REGRESSION: this tool reviews repos the runner OWNS, so on a solo
+# repo the PR author IS the runner. Excluding every comment by login (not just
+# the bot's own marker-led comments) makes the owner's own rebuttal invisible
+# forever -- exactly the "skipped forever" shape C2 existed to kill, recreated
+# for the one account that matters most. Only a runner comment that ALSO
+# starts with the state marker (i.e. is the bot's own persona/summary comment)
+# may be excluded.
+ONLY_SELF_REPLY='[
+ {"id":8,"user":{"login":"yoshi"},"url":"u8","updated_at":"2026-08-26T11:00:00Z",
+  "body":"False positive: the token is validated in middleware."}
+]'
+eq "the runner's own reply (no leading marker) counts as a reply" \
+  '2026-08-26T11:00:00Z' "$(newest_reply "$ONLY_SELF_REPLY" "$RUNNER")"
+contains "the runner's own reply text reaches the persona" \
+  "$(reply_bodies "$ONLY_SELF_REPLY" "" "$RUNNER")" 'validated in middleware'
+
+ONLY_BOT='[
+ {"id":7,"user":{"login":"yoshi"},"url":"u7","updated_at":"2026-08-26T13:00:00Z",
+  "body":"<!-- pr-reviewer persona=security head=abc seen=x verdict=open -->\nold finding"}
+]'
+eq "the bot's own marker-led comment alone triggers no self-review loop" "" \
+  "$(newest_reply "$ONLY_BOT" "$RUNNER")"
+eq "the bot's own marker-led comment alone yields no reply text" "" \
+  "$(reply_bodies "$ONLY_BOT" "" "$RUNNER")"
+
+SELF_MIXED='[
+ {"id":7,"user":{"login":"yoshi"},"url":"u7","updated_at":"2026-08-26T13:00:00Z",
+  "body":"<!-- pr-reviewer persona=security head=abc seen=x verdict=open -->\nold finding"},
+ {"id":8,"user":{"login":"yoshi"},"url":"u8","updated_at":"2026-08-26T11:00:00Z",
+  "body":"False positive: the token is validated in middleware."}
+]'
+eq "the marker-led comment is excluded even though it is newer than the reply" \
+  '2026-08-26T11:00:00Z' "$(newest_reply "$SELF_MIXED" "$RUNNER")"
+
 # --- DRY_RUN must not call gh ---
 cat >"$STUB/bin/gh" <<'STUBEOF'
 #!/usr/bin/env bash

@@ -155,12 +155,18 @@ run_persona() { # run_persona <persona> <dir> <prompt-file>
   )
 }
 
-# Excludes comments by login, not by content: a quoted reply (e.g. GitHub's
-# "Quote reply") copies the state block verbatim into a human's own comment,
-# and matching on content would make that reply invisible forever.
+# Excludes a comment only when it is BOTH the runner's AND starts with the
+# state marker, i.e. it is the bot's own persona/summary comment. Excluding by
+# login alone would hide a solo repo owner's own replies (the owner IS the
+# runner there) forever; excluding by marker-content alone would hide a
+# GitHub quote-reply, which copies the marker verbatim into a human's own
+# comment. render_comment/render_summary always emit the marker first, so the
+# bot never re-triggers on itself; a quote-reply's body starts with "> ", not
+# the marker, so it still counts as a reply.
 newest_reply() { # newest_reply <comments-json> <runner-login>
   jq -r --arg me "$2" \
-    '[.[] | select(.user.login != $me) | .updated_at] | max // empty' <<<"$1"
+    '[.[] | select(.user.login != $me or (.body | startswith("<!-- pr-reviewer ") | not))
+          | .updated_at] | max // empty' <<<"$1"
 }
 
 # The task builder needs reply text, not a timestamp. NO_REPLIES is an epoch
@@ -170,7 +176,7 @@ NO_REPLIES=1970-01-01T00:00:00Z
 
 reply_bodies() { # reply_bodies <comments-json> <since-iso8601> <runner-login>
   jq -r --arg since "${2:-}" --arg me "$3" \
-    '[.[] | select(.user.login != $me)
+    '[.[] | select(.user.login != $me or (.body | startswith("<!-- pr-reviewer ") | not))
           | select($since == "" or .updated_at > $since)
           | "@" + (.user.login // "someone") + ": " + .body]
      | join("\n\n")' <<<"$1"
