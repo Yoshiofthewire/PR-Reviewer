@@ -12,3 +12,16 @@ repo_allowed() { # repo_allowed <repo>
   case ",$allow," in *",$repo,"*) return 0 ;; esac
   return 1
 }
+
+state_emit() { # state_emit <persona> <head> <seen> <verdict>
+  printf '<!-- pr-reviewer persona=%s head=%s seen=%s verdict=%s -->' "$1" "$2" "$3" "$4"
+}
+
+state_field() { # state_field <comment-body> <field>
+  local body="$1" field="$2" block re
+  block=$(grep -o -m1 '<!-- pr-reviewer [^>]*-->' <<<"$body")
+  [[ -n $block ]] || return 0
+  re="[[:space:]]$field=([^[:space:]]+)"
+  [[ $block =~ $re ]] && printf '%s' "${BASH_REMATCH[1]}"
+  return 0
+}
