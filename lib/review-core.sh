@@ -70,3 +70,23 @@ render_summary() { # render_summary <head> <seen> <cleared-count> <status-lines>
     "$(state_emit summary "$head" "$seen" "$verdict")" \
     "$cleared" "${#PERSONA_ORDER[@]}" "$lines"
 }
+
+# Publishing an exploitable finding against an unfixed public branch is
+# uncoordinated disclosure, so public security reports name severity and file only.
+redact_findings() { # redact_findings <persona> <is-public 0|1> <body>
+  local persona="$1" public="$2" body="$3" line sev="P?" file
+  if [[ $persona != security || $public != 1 ]]; then
+    printf '%s' "$body"
+    return 0
+  fi
+  printf 'Detail withheld: this repository is public, and posting an unfixed finding here would be public disclosure. The full report was written to the operator local report file.\n'
+  while IFS= read -r line; do
+    if [[ $line =~ ^\#\#\#[[:space:]]\[(P[0-9])\] ]]; then
+      sev="${BASH_REMATCH[1]}"
+    elif [[ $line =~ ^-[[:space:]]Location:[[:space:]]\`([^:\`]+) ]]; then
+      file="${BASH_REMATCH[1]}"
+      printf '\n- %s in `%s`' "$sev" "$file"
+    fi
+  done <<<"$body"
+  printf '\n'
+}

@@ -120,5 +120,29 @@ contains "summary reports the tally" "$S" '2/3 personas cleared'
 contains "summary is a summary state block" "$S" 'persona=summary'
 contains "summary lists each persona" "$S" '- hostile: changes required'
 
+# --- public repository redaction ---
+FINDING='### [P0] Reject unsigned tokens
+- Location: `auth/verify.go:88`
+- Problem: SECRETDETAIL the verifier accepts alg=none so any token passes
+- Fix: pin the algorithm
+- Verify: go test ./auth -run TestAlgNone'
+
+PUB=$(redact_findings security 1 "$FINDING")
+lacks "public security redaction hides the problem text" "$PUB" 'SECRETDETAIL'
+lacks "public security redaction hides the fix" "$PUB" 'pin the algorithm'
+contains "public security redaction keeps severity" "$PUB" 'P0'
+contains "public security redaction keeps the file" "$PUB" 'auth/verify.go'
+lacks "public security redaction hides the line number" "$PUB" 'verify.go:88'
+contains "public security redaction explains itself" "$PUB" 'withheld'
+
+PRIV=$(redact_findings security 0 "$FINDING")
+eq "private repos publish security findings in full" "$FINDING" "$PRIV"
+
+OTHER=$(redact_findings hostile 1 "$FINDING")
+eq "non-security personas publish in full on public repos" "$FINDING" "$OTHER"
+
+CLEAN=$(redact_findings security 1 'No findings.')
+contains "redaction of a clean report still explains itself" "$CLEAN" 'withheld'
+
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"
