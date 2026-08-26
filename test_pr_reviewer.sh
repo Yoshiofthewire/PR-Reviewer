@@ -173,7 +173,8 @@ case "$1 $2" in
  {"repository":{"nameWithOwner":"yoshi/alpha"},"number":1,"updatedAt":"2026-08-26T10:00:00Z","title":"Alpha","isDraft":false},
  {"repository":{"nameWithOwner":"yoshi/beta"},"number":2,"updatedAt":"2026-08-26T12:00:00Z","title":"Beta","isDraft":false},
  {"repository":{"nameWithOwner":"orgone/gamma"},"number":3,"updatedAt":"2026-08-26T11:00:00Z","title":"Gamma","isDraft":false},
- {"repository":{"nameWithOwner":"yoshi/skipme"},"number":4,"updatedAt":"2026-08-26T13:00:00Z","title":"Skip","isDraft":false}
+ {"repository":{"nameWithOwner":"yoshi/skipme"},"number":4,"updatedAt":"2026-08-26T13:00:00Z","title":"Skip","isDraft":false},
+ {"repository":{"nameWithOwner":"yoshi/wip"},"number":5,"updatedAt":"2026-08-26T14:00:00Z","title":"Work in progress","isDraft":true}
 ]
 JSON
     ;;
@@ -202,6 +203,27 @@ eq "cap limits the batch" 2 "$(wc -l <<<"$CAPPED")"
 contains "capped PRs are named on stderr" "$(cat "$STUB/err")" 'yoshi/alpha#1'
 
 STUB_ORGS_FAIL=1 rc "discover_prs fails when org lookup fails" 1 discover_prs
+
+# --- every dropped PR must say WHY it was dropped ---
+eq "filter reason names the denylist" 'excluded by EXCLUDE_REPOSITORIES' \
+  "$(EXCLUDE_REPOSITORIES=me/x repo_filter_reason me/x)"
+eq "filter reason names the allowlist" 'not in REPOSITORIES allowlist' \
+  "$(REPOSITORIES=me/other EXCLUDE_REPOSITORIES= repo_filter_reason me/x)"
+
+REPOSITORIES="" EXCLUDE_REPOSITORIES="yoshi/skipme" MAX_PRS_PER_TICK=10
+DROPPED=$(discover_prs 2>&1 >/dev/null)
+KEPT=$(discover_prs 2>/dev/null)
+lacks "a draft PR never reaches the review queue" "$KEPT" 'yoshi/wip'
+contains "a draft PR is named when skipped" "$DROPPED" 'yoshi/wip#5'
+contains "a draft PR says it was skipped for being a draft" "$DROPPED" 'draft'
+contains "a filtered repo is named when skipped" "$DROPPED" 'yoshi/skipme#4'
+contains "a filtered repo says which list excluded it" "$DROPPED" 'EXCLUDE_REPOSITORIES'
+contains "discovery reports a tally" "$DROPPED" 'to review'
+
+# shellcheck disable=SC2034  # MAX_PRS_PER_TICK is read by discover_prs
+MAX_PRS_PER_TICK=1
+CAPMSG=$(discover_prs 2>&1 >/dev/null)
+contains "a deferred PR says the cap is why" "$CAPMSG" 'per-tick cap of 1 reached'
 
 # --- discovery must never silently truncate ---
 # gh search prs with no --sort returns 100 by best-match relevance, and
@@ -632,6 +654,32 @@ contains "tally counts only the genuinely cleared persona" "$OUT_B" '1/3 persona
 
 contains "private repo publishes the finding in full (no redaction)" "$OUT_B" 'SECRETDETAIL'
 lacks "DRY_RUN never invokes gh with --method (test B)" "$(cat "$STUB_GH_LOG")" '--method'
+
+# --- an up-to-date PR reports rc 2, and explains itself only under VERBOSE ---
+# All three personas already carry the current head and have seen every reply,
+# so nothing is pending and review_pr must return early without invoking claude.
+cat >"$STUB/comments-current.json" <<'JSON'
+[
+ {"id":1,"url":"u1","updated_at":"2026-08-26T09:00:00Z","user":{"login":"yoshi"},
+  "body":"<!-- pr-reviewer persona=security head=abc123 seen=1970-01-01T00:00:00Z verdict=cleared -->\nok"},
+ {"id":2,"url":"u2","updated_at":"2026-08-26T09:00:00Z","user":{"login":"yoshi"},
+  "body":"<!-- pr-reviewer persona=simplicity head=abc123 seen=1970-01-01T00:00:00Z verdict=cleared -->\nok"},
+ {"id":3,"url":"u3","updated_at":"2026-08-26T09:00:00Z","user":{"login":"yoshi"},
+  "body":"<!-- pr-reviewer persona=hostile head=abc123 seen=1970-01-01T00:00:00Z verdict=cleared -->\nok"}
+]
+JSON
+export STUB_COMMENTS_FILE="$STUB/comments-current.json"
+: >"$STUB_CLAUDE_LOG"
+
+VERBOSE="" rc "an up-to-date PR returns 2, not 0" 2 review_pr yoshi/alpha 1 yoshi
+eq "an up-to-date PR never invokes claude" "" "$(cat "$STUB_CLAUDE_LOG")"
+
+QUIET=$(VERBOSE="" review_pr yoshi/alpha 1 yoshi 2>&1 >/dev/null)
+eq "the steady-state skip stays quiet by default" "" "$QUIET"
+
+LOUD=$(VERBOSE=1 review_pr yoshi/alpha 1 yoshi 2>&1 >/dev/null)
+contains "VERBOSE names the up-to-date PR" "$LOUD" 'yoshi/alpha#1'
+contains "VERBOSE explains the head was already reviewed" "$LOUD" 'already reviewed'
 
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"

@@ -16,6 +16,12 @@ resolve_owners() {
   gh api user/orgs --jq '.[].login' || return 1
 }
 
+# One aligned decision per line, on stderr so stdout stays machine-readable TSV.
+# Every path that drops a pull request logs here, so a skip is never silent.
+log_pr() { # log_pr <action> <repo#number> <detail>
+  printf '  %-7s %-44s %s\n' "$1" "$2" "$3" >&2
+}
+
 discover_prs() {
   local owners=() owner args=() kept=0 owners_raw repo number updated title
   owners_raw=$(resolve_owners) || return 1
@@ -33,21 +39,36 @@ discover_prs() {
   [[ $count -eq 100 ]] &&
     echo "WARNING: discovery hit the 100-PR query limit; some open PRs may not have been seen this tick" >&2
 
-  while IFS=$'\t' read -r repo number updated title; do
+  # Drafts are filtered here rather than in jq so each one can be named.
+  local draft total=0 deferred=0 skipped=0
+  while IFS=$'\t' read -r repo number updated title draft; do
     [[ -n $repo ]] || continue
-    repo_allowed "$repo" || continue
+    total=$((total + 1))
+    if [[ $draft == true ]]; then
+      log_pr skip "$repo#$number" 'draft'
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if ! repo_allowed "$repo"; then
+      log_pr skip "$repo#$number" "$(repo_filter_reason "$repo")"
+      skipped=$((skipped + 1))
+      continue
+    fi
     if [[ $kept -ge $MAX_PRS_PER_TICK ]]; then
-      echo "cap reached, deferring $repo#$number to a later tick" >&2
+      log_pr defer "$repo#$number" "per-tick cap of $MAX_PRS_PER_TICK reached"
+      deferred=$((deferred + 1))
       continue
     fi
     kept=$((kept + 1))
+    log_pr review "$repo#$number" "$title"
     printf '%s\t%s\t%s\t%s\n' "$repo" "$number" "$updated" "$title"
   done < <(
-    jq -r 'map(select(.isDraft | not))
-           | sort_by(.updatedAt) | reverse
-           | .[] | [.repository.nameWithOwner, .number, .updatedAt, .title]
+    jq -r 'sort_by(.updatedAt) | reverse
+           | .[] | [.repository.nameWithOwner, .number, .updatedAt, .title, .isDraft]
            | @tsv' <<<"$raw"
   )
+  printf '\n  %s open · %s to review · %s deferred · %s skipped\n\n' \
+    "$total" "$kept" "$deferred" "$skipped" >&2
 }
 
 WORK_DIR="${WORK_DIR:-${XDG_RUNTIME_DIR:-/tmp}/pr-reviewer}"
@@ -251,10 +272,14 @@ review_pr() { # review_pr <repo> <number> <runner-login>
     VERDICTS[$persona]=$(state_field "$body_text" verdict)
     needs_review "$state_head" "$state_seen" "$head_sha" "$newest" && pending+=("$persona")
   done
+  # Return 2, not 0, so the tick can count "nothing to do" apart from "reviewed".
   if [[ ${#pending[@]} -eq 0 ]]; then
-    echo "skip $repo#$number: all personas current at ${head_sha:0:8}"
-    return 0
+    [[ -n ${VERBOSE:-} ]] && log_pr skip "$repo#$number" \
+      "up to date — head ${head_sha:0:8} already reviewed, no reply since ${newest:-none}"
+    return 2
   fi
+  [[ ${#pending[@]} -eq ${#PERSONA_ORDER[@]} ]] ||
+    log_pr "" "$repo#$number" "re-reviewing ${pending[*]}; others current at ${head_sha:0:8}"
 
   dir="$WORK_DIR/co-$$-$number"
   mkdir -p "$WORK_DIR" || return 1
@@ -314,7 +339,7 @@ review_pr() { # review_pr <repo> <number> <runner-login>
   render_summary "$head_sha" "${newest:-$NO_REPLIES}" "$cleared" "$lines" >"$WORK_DIR/body.$$"
   upsert_comment "$repo" "$number" "$url" "$WORK_DIR/body.$$" || rc=1
 
-  echo "reviewed $repo#$number: $cleared/${#PERSONA_ORDER[@]} cleared"
+  log_pr 'done' "$repo#$number" "$cleared/${#PERSONA_ORDER[@]} personas cleared"
   return $rc
 }
 
@@ -337,18 +362,29 @@ main() {
   # Capture discovery output before iterating: a `while ... < <(discover_prs)`
   # process substitution cannot see discover_prs's exit status, so a discovery
   # failure would silently loop zero times and exit 0 instead of failing loudly.
-  local prs repo number failures=0
+  local prs repo number failures=0 reviewed=0 current=0 prc
+  echo "pr-reviewer · scanning" >&2
   prs=$(discover_prs) || { echo "ERROR: discovery failed" >&2; exit 1; }
   if [[ -n $prs ]]; then
     while IFS=$'\t' read -r repo number _ _; do
       [[ -n $repo ]] || continue
       # One bad PR must not stop the rest of the tick.
-      review_pr "$repo" "$number" "$runner" ||
-        { failures=$((failures + 1)); echo "ERROR $repo#$number" >&2; }
+      review_pr "$repo" "$number" "$runner"
+      prc=$?
+      case $prc in
+        0) reviewed=$((reviewed + 1)) ;;
+        2) current=$((current + 1)) ;;
+        *) failures=$((failures + 1)); log_pr FAILED "$repo#$number" 'see errors above' ;;
+      esac
     done <<<"$prs"
   fi
 
-  [[ $failures -eq 0 ]] || { echo "$failures pull request(s) failed" >&2; exit 1; }
+  local hint=""
+  [[ $current -gt 0 && -z ${VERBOSE:-} ]] && hint=" (VERBOSE=1 to list)"
+  printf '\npr-reviewer · %s reviewed · %s up to date%s · %s failed\n' \
+    "$reviewed" "$current" "$hint" "$failures" >&2
+
+  [[ $failures -eq 0 ]] || exit 1
 }
 
 if [[ ${BASH_SOURCE[0]:-} == "$0" ]]; then

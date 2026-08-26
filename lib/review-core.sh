@@ -105,3 +105,13 @@ redact_findings() { # redact_findings <persona> <is-public 0|1> <body> [local-re
   done <<<"$body"
   printf '\n'
 }
+
+# Why repo_allowed rejected a repo. Logging only; never gates behaviour.
+repo_filter_reason() { # repo_filter_reason <repo>
+  local repo="$1" deny="${EXCLUDE_REPOSITORIES:-}"
+  deny="${deny// /}"
+  case ",$deny," in
+    *",$repo,"*) printf 'excluded by EXCLUDE_REPOSITORIES'; return 0 ;;
+  esac
+  printf 'not in REPOSITORIES allowlist'
+}
