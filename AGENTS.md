@@ -53,8 +53,10 @@
 ## Verification
 
 - `./test_pr_reviewer.sh`
-- `shellcheck -S warning pr-reviewer.sh lib/review-core.sh test_pr_reviewer.sh`
-- `bash -n pr-reviewer.sh lib/review-core.sh`
+- `shellcheck -S warning` on each of `pr-reviewer.sh`, `lib/review-core.sh`,
+  `test_pr_reviewer.sh`, `install.sh`, and `verify_isolation.sh` individually.
+  Linting them together previously masked a real SC2034 warning.
+- `bash -n pr-reviewer.sh lib/review-core.sh install.sh verify_isolation.sh`
 - `./verify_isolation.sh` after any change to the persona invocation.
 - `DRY_RUN=1 ./pr-reviewer.sh` before any behaviour change goes live.
 

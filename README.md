@@ -70,18 +70,30 @@ Three properties this relies on were measured, not assumed, and are re-checked b
 - `--tools` alone does not restrict MCP tools; without `--strict-mcp-config` a
   reviewer is offered Gmail, Firebase deploy, and Playwright code execution.
 
-Belt and braces: `CLAUDE.md`, `AGENTS.md`, `.claude/`, and `.cursor/` in the
+Belt and braces: `CLAUDE.md`, `AGENTS.md`, and `.claude/` in the
 checkout are renamed with a `.quarantined` suffix before review, so they are
 readable as data but are not auto-loaded. There is no Bash, Write, or network
 tool, so a successful injection can only produce misleading text; the runner, not
 the model, owns the comment envelope and signature.
 
 On public repositories the `security` persona posts severity and file only.
-Posting an unfixed exploitable finding to a public comment is disclosure.
+Posting an unfixed exploitable finding to a public comment is disclosure. The
+full finding is written locally to
+`${XDG_STATE_HOME:-$HOME/.local/state}/pr-reviewer/<owner>-<repo>-<number>-<sha>.md`,
+mode 600, before redaction. This also happens under `DRY_RUN`, since a
+dry-running operator still needs to see the withheld detail; the comment names
+the actual path, or says the write failed rather than claiming a file exists.
+
+Every invocation takes an flock at `${XDG_STATE_HOME:-$HOME/.local/state}/pr-reviewer.lock`
+before doing any work, whether started by the timer or run directly, so a slow
+tick cannot have its checkout deleted out from under it by a concurrent one. A
+second concurrent run exits quietly.
 
 ## Development
 
 ```sh
 ./test_pr_reviewer.sh
-shellcheck -S warning pr-reviewer.sh lib/review-core.sh test_pr_reviewer.sh
+for f in pr-reviewer.sh lib/review-core.sh test_pr_reviewer.sh install.sh verify_isolation.sh; do
+  shellcheck -S warning "$f"
+done
 ```

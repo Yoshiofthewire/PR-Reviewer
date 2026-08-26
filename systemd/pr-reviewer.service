@@ -4,7 +4,8 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-# flock -n makes a slow tick skip rather than stack on the next one.
-ExecStart=/usr/bin/flock -n %h/.local/state/pr-reviewer.lock %h/git/PR-Reviewer/pr-reviewer.sh
+# pr-reviewer.sh takes its own flock (self-exec'd), so a slow tick makes the
+# next one skip rather than stack, regardless of how the script is invoked.
+ExecStart=%h/git/PR-Reviewer/pr-reviewer.sh
 WorkingDirectory=%h/git/PR-Reviewer
 Environment=MAX_PRS_PER_TICK=5
