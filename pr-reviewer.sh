@@ -192,12 +192,13 @@ upsert_comment() { # upsert_comment <repo> <number> <comment-url> <body-file>
 review_pr() { # review_pr <repo> <number>
   local repo="$1" number="$2"
   local head_sha comments newest dir persona pc body_text state_head state_seen
-  local prior url out verdict body cleared=0 lines="" truncated="" rc=0
+  local prior url out verdict body cleared=0 lines="" truncated="" rc=0 repo_json
   local -A VERDICTS=()
   local pending=()
 
   head_sha=$(gh pr view --repo "$repo" "$number" --json headRefOid --jq .headRefOid) || return 1
-  IS_PUBLIC=$(gh repo view "$repo" --json isPrivate --jq 'if .isPrivate then 0 else 1 end') || return 1
+  repo_json=$(gh repo view "$repo" --json isPrivate) || return 1
+  IS_PUBLIC=$(visibility_flag "$repo_json")
   comments=$(gh api --paginate "repos/$repo/issues/$number/comments") || return 1
   newest=$(newest_reply "$comments")
 
@@ -268,6 +269,7 @@ review_pr() { # review_pr <repo> <number>
 main() {
   command -v gh >/dev/null || { echo "ERROR: gh is required" >&2; exit 1; }
   command -v jq >/dev/null || { echo "ERROR: jq is required" >&2; exit 1; }
+  command -v git >/dev/null || { echo "ERROR: git is required" >&2; exit 1; }
   command -v claude >/dev/null || { echo "ERROR: claude is required" >&2; exit 1; }
   gh auth status >/dev/null 2>&1 ||
     { echo "ERROR: gh is not authenticated; run 'gh auth login'" >&2; exit 1; }

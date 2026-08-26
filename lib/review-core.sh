@@ -71,6 +71,15 @@ render_summary() { # render_summary <head> <seen> <cleared-count> <status-lines>
     "$cleared" "${#PERSONA_ORDER[@]}" "$lines"
 }
 
+# Fails closed: anything that isn't unambiguously private (isPrivate:true) is
+# treated as public. Over-redacting a private repo is a cosmetic annoyance;
+# under-redacting a public one is a disclosure, so ambiguity must resolve to 1.
+visibility_flag() { # visibility_flag <gh repo view --json isPrivate output>
+  local out
+  out=$(jq -r 'if .isPrivate == true then 0 else 1 end' <<<"$1" 2>/dev/null)
+  [[ $out == 0 || $out == 1 ]] && printf '%s' "$out" || printf '1'
+}
+
 # Publishing an exploitable finding against an unfixed public branch is
 # uncoordinated disclosure, so public security reports name severity and file only.
 redact_findings() { # redact_findings <persona> <is-public 0|1> <body>

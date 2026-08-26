@@ -379,14 +379,130 @@ contains "live run posts a new comment" "$(cat "$STUB_GH_LOG")" 'POST'
 DRY_RUN="" upsert_comment yoshi/alpha 1 "https://api/comments/9" "$STUB/body" >/dev/null
 contains "live run patches an existing comment" "$(cat "$STUB_GH_LOG")" 'PATCH'
 
-# --- IS_PUBLIC must be exactly 0 or 1 ---
+# --- visibility_flag must be exactly 0 or 1, and fail closed ---
 # redact_findings gates redaction with a literal comparison against "1"; if this
-# ever produced "true"/"false" instead, redaction would silently disable and a
-# security finding could be published on a public repo.
-eq "public repo (isPrivate=false) yields IS_PUBLIC=1" 1 \
-  "$(echo '{"isPrivate":false}' | jq -r 'if .isPrivate then 0 else 1 end')"
-eq "private repo (isPrivate=true) yields IS_PUBLIC=0" 0 \
-  "$(echo '{"isPrivate":true}' | jq -r 'if .isPrivate then 0 else 1 end')"
+# ever produced "true"/"false" instead, or inverted its if/else, redaction would
+# silently disable and a security finding could be published on a public repo.
+# This drives pr-reviewer.sh's actual call site (visibility_flag), not a copy.
+eq "public repo (isPrivate=false) yields exactly 1" 1 \
+  "$(visibility_flag '{"isPrivate":false}')"
+eq "private repo (isPrivate=true) yields exactly 0" 0 \
+  "$(visibility_flag '{"isPrivate":true}')"
+eq "missing isPrivate field fails closed to public" 1 \
+  "$(visibility_flag '{}')"
+eq "malformed input fails closed to public" 1 \
+  "$(visibility_flag 'not json')"
+eq "empty input fails closed to public" 1 \
+  "$(visibility_flag '')"
+
+# --- review_pr integration: gh, git, and claude all stubbed; no network ---
+# The visibility_flag tests above prove the mapping is correct in isolation;
+# this drives review_pr end-to-end so a wiring mistake (wrong argument, wrong
+# gate, wrong tally) fails too, not just a re-test of the same unit.
+
+cat >"$STUB/bin/git" <<'STUBEOF'
+#!/usr/bin/env bash
+exit 0
+STUBEOF
+chmod +x "$STUB/bin/git"
+
+WORK_DIR="$STUB/rpwork"
+export STUB_CLAUDE_LOG="$STUB/claude.log"
+
+cat >"$STUB/bin/gh" <<'STUBEOF'
+#!/usr/bin/env bash
+echo "$*" >>"$STUB_GH_LOG"
+case "$1 $2" in
+  "pr view") echo "$STUB_HEAD_SHA" ;;
+  "repo view") echo "$STUB_REPO_JSON" ;;
+  "api --paginate") cat "$STUB_COMMENTS_FILE" ;;
+  "pr diff") printf 'diff --git a/x b/x\n+added line\n' ;;
+esac
+STUBEOF
+chmod +x "$STUB/bin/gh"
+
+# Security's finding text is fixed content the stub prints only when invoked
+# with the security-audit skill (identifiable via --system-prompt content),
+# so a persona that should be skipped this tick would show up here if it ran.
+cat >"$STUB/bin/claude" <<'STUBEOF'
+#!/usr/bin/env bash
+echo "$*" >>"$STUB_CLAUDE_LOG"
+case "$*" in
+  *security-audit*)
+    cat <<'FINDING'
+### [P0] Reject unsigned tokens
+- Location: `auth/verify.go:88`
+- Problem: SECRETDETAIL the verifier accepts alg=none so any token passes
+- Fix: pin the algorithm SECRETFIX
+- Verify: go test ./auth -run TestAlgNone
+VERDICT: CHANGES_REQUIRED
+FINDING
+    ;;
+  *ponytail-review*) echo 'VERDICT: CLEARED' ;;
+  *hostile-review*) echo 'VERDICT: CLEARED' ;;
+esac
+STUBEOF
+chmod +x "$STUB/bin/claude"
+
+# --- Test A: nothing reviewed before, all three personas run, public repo ---
+export STUB_HEAD_SHA=abc123
+export STUB_REPO_JSON='{"isPrivate":false}'
+export STUB_COMMENTS_FILE="$STUB/comments-empty.json"
+echo '[]' >"$STUB_COMMENTS_FILE"
+: >"$STUB_GH_LOG"
+: >"$STUB_CLAUDE_LOG"
+
+export DRY_RUN=1
+OUT_A=$(review_pr yoshi/alpha 1)
+
+contains "review_pr renders security's state block with the head sha" "$OUT_A" \
+  'persona=security head=abc123'
+contains "review_pr renders simplicity's state block with the head sha" "$OUT_A" \
+  'persona=simplicity head=abc123'
+contains "review_pr renders hostile's state block with the head sha" "$OUT_A" \
+  'persona=hostile head=abc123'
+
+contains "security comment is signed" "$OUT_A" "$(signature "$CLAUDE_MODEL" security-audit)"
+contains "simplicity comment is signed" "$OUT_A" "$(signature "$CLAUDE_MODEL" ponytail-review)"
+contains "hostile comment is signed" "$OUT_A" "$(signature "$CLAUDE_MODEL" hostile-review)"
+
+contains "summary reports the correct tally" "$OUT_A" '2/3 personas cleared'
+
+lacks "public redaction hides the Problem text" "$OUT_A" 'SECRETDETAIL'
+lacks "public redaction hides the Fix text" "$OUT_A" 'SECRETFIX'
+contains "public redaction keeps the severity" "$OUT_A" 'P0'
+contains "public redaction keeps the file" "$OUT_A" 'auth/verify.go'
+
+lacks "DRY_RUN never invokes gh with --method (test A)" "$(cat "$STUB_GH_LOG")" '--method'
+
+# --- Test B: hostile and simplicity already reviewed at this head with no new
+# replies (skipped), security never reviewed (runs); private repo this time ---
+HOSTILE_PRIOR=$(render_comment hostile "$CLAUDE_MODEL" abc123 "$NO_REPLIES" cleared 'Nothing left.')
+SIMPLICITY_PRIOR=$(render_comment simplicity "$CLAUDE_MODEL" abc123 "$NO_REPLIES" open \
+  '### [P2] Old finding')
+jq -n --arg h "$HOSTILE_PRIOR" --arg s "$SIMPLICITY_PRIOR" \
+  '[{id:10, url:"https://api/comments/10", updated_at:"2026-08-26T09:00:00Z", body:$h},
+    {id:11, url:"https://api/comments/11", updated_at:"2026-08-26T09:00:00Z", body:$s}]' \
+  >"$STUB/comments-mixed.json"
+
+export STUB_REPO_JSON='{"isPrivate":true}'
+export STUB_COMMENTS_FILE="$STUB/comments-mixed.json"
+: >"$STUB_GH_LOG"
+: >"$STUB_CLAUDE_LOG"
+
+OUT_B=$(review_pr yoshi/alpha 1)
+
+lacks "hostile is not re-invoked when skipped" "$(cat "$STUB_CLAUDE_LOG")" 'hostile-review'
+lacks "simplicity is not re-invoked when skipped" "$(cat "$STUB_CLAUDE_LOG")" 'ponytail-review'
+contains "security is invoked (never reviewed before)" "$(cat "$STUB_CLAUDE_LOG")" 'security-audit'
+
+contains "skipped persona's cleared verdict carries into the tally" "$OUT_B" '- hostile: cleared'
+contains "skipped persona's open verdict carries into the tally" "$OUT_B" '- simplicity: open'
+contains "freshly reviewed persona appears in the tally" "$OUT_B" '- security: open'
+contains "tally counts only the genuinely cleared persona" "$OUT_B" '1/3 personas cleared'
+
+contains "private repo publishes the finding in full (no redaction)" "$OUT_B" 'SECRETDETAIL'
+lacks "DRY_RUN never invokes gh with --method (test B)" "$(cat "$STUB_GH_LOG")" '--method'
 
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"
