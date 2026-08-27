@@ -30,6 +30,14 @@ lacks() { # lacks <desc> <haystack> <needle>
   return 0
 }
 
+# BSD `wc -l` pads its count with spaces and BSD `stat` takes different flags
+# than GNU's, so both are wrapped rather than spelled inline at each call site.
+lines() { awk 'END { print NR }'; }
+
+mode() { # mode <path>
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
 # --- repo_allowed ---
 REPOSITORIES="" EXCLUDE_REPOSITORIES=""
 rc "no lists allows everything" 0 repo_allowed me/kept
@@ -189,14 +197,14 @@ eq "resolve_owners lists the user and every org" \
 REPOSITORIES="" EXCLUDE_REPOSITORIES="yoshi/skipme" MAX_PRS_PER_TICK=10
 OUT=$(discover_prs 2>/dev/null)
 lacks "denylisted repo is filtered out" "$OUT" 'skipme'
-eq "three PRs survive the filter" 3 "$(wc -l <<<"$OUT")"
+eq "three PRs survive the filter" 3 "$(lines <<<"$OUT")"
 eq "newest updatedAt sorts first" 'yoshi/beta' "$(head -1 <<<"$OUT" | cut -f1)"
 eq "oldest updatedAt sorts last" 'yoshi/alpha' "$(tail -1 <<<"$OUT" | cut -f1)"
 
 # shellcheck disable=SC2034  # REPOSITORIES, EXCLUDE_REPOSITORIES, MAX_PRS_PER_TICK used by discover_prs
 REPOSITORIES="" EXCLUDE_REPOSITORIES="" MAX_PRS_PER_TICK=2
 CAPPED=$(discover_prs 2>"$STUB/err")
-eq "cap limits the batch" 2 "$(wc -l <<<"$CAPPED")"
+eq "cap limits the batch" 2 "$(lines <<<"$CAPPED")"
 contains "capped PRs are named on stderr" "$(cat "$STUB/err")" 'yoshi/alpha#1'
 
 STUB_ORGS_FAIL=1 rc "discover_prs fails when org lookup fails" 1 discover_prs
@@ -288,7 +296,7 @@ export STUB_GH_ARGS_LOG="$STUB/gh-args.log"
 REPOSITORIES="" EXCLUDE_REPOSITORIES="" MAX_PRS_PER_TICK=1000
 FULL=$(discover_prs 2>"$STUB/err100")
 eq "all 100 discovered PRs pass through when the cap is high enough" \
-  100 "$(wc -l <<<"$FULL")"
+  100 "$(lines <<<"$FULL")"
 contains "discovery requests a deterministic newest-first sort" \
   "$(cat "$STUB_GH_ARGS_LOG")" '--sort updated --order desc'
 contains "hitting the query limit is logged, not silently dropped" \
@@ -651,7 +659,7 @@ REPORT_PATH_A=$(security_report_path yoshi/alpha 1 abc123)
 contains "the local security report holds the unredacted finding" \
   "$(cat "$REPORT_PATH_A" 2>/dev/null)" 'SECRETDETAIL'
 eq "the local security report is owner-readable only" 600 \
-  "$(stat -c '%a' "$REPORT_PATH_A" 2>/dev/null)"
+  "$(mode "$REPORT_PATH_A")"
 contains "the public comment names the actual report path" "$OUT_A" "$REPORT_PATH_A"
 
 # --- Test B: security already cleared against an older head, so the push
