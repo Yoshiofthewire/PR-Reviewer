@@ -3,7 +3,7 @@
 ## Purpose
 
 - Review open pull requests across owned and organization repositories from a
-  local machine, through three persona reviewers.
+  local machine, through the `security` persona reviewer.
 - Resolve each finding over time as the author pushes fixes or replies.
 
 ## Ownership

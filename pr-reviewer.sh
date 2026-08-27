@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Review open pull requests locally through three persona reviewers.
+# Review open pull requests locally through the security persona reviewer.
 set -uo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -49,7 +49,7 @@ discover_prs() {
       skipped=$((skipped + 1))
       continue
     fi
-    # Dependency bumps cost three persona reviews and tell you nothing.
+    # Dependency bumps cost a full security review and tell you nothing.
     # Keyed on author type, not login, so renovate and *-preview[bot] match too.
     if [[ $authortype == Bot && -z ${REVIEW_BOT_PRS:-} ]]; then
       log_pr skip "$repo#$number" "authored by $author (bot; REVIEW_BOT_PRS=1 to include)"
@@ -298,8 +298,6 @@ review_pr() { # review_pr <repo> <number> <runner-login>
       "up to date — head ${head_sha:0:8} already reviewed, no reply since ${newest:-none}"
     return 2
   fi
-  [[ ${#pending[@]} -eq ${#PERSONA_ORDER[@]} ]] ||
-    log_pr "" "$repo#$number" "re-reviewing ${pending[*]}; others current at ${head_sha:0:8}"
 
   dir="$WORK_DIR/co-$$-$number"
   mkdir -p "$WORK_DIR" || return 1

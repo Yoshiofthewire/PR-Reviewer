@@ -63,7 +63,7 @@ eq "absent field yields empty" "" "$(state_field "$BLOCK" nosuchfield)"
 eq "malformed block yields empty" "" "$(state_field '<!-- pr-reviewer -->' head)"
 
 # A comment quoting a state block in prose must not shadow the real one.
-FIRST=$(state_emit hostile aaa 2026-01-01T00:00:00Z cleared)
+FIRST=$(state_emit security aaa 2026-01-01T00:00:00Z cleared)
 eq "first block wins" aaa "$(state_field "$FIRST"$'\n'"$BLOCK" head)"
 
 # --- needs_review decision table ---
@@ -89,9 +89,7 @@ rc "first reply with empty seen needs review" 0 needs_review abc "" abc "$T1"
 
 # --- persona table ---
 eq "security uses the security-audit skill" security-audit "${PERSONA_SKILL[security]}"
-eq "simplicity uses the ponytail-review skill" ponytail-review "${PERSONA_SKILL[simplicity]}"
-eq "hostile uses the hostile-review skill" hostile-review "${PERSONA_SKILL[hostile]}"
-eq "three personas are defined" 3 "${#PERSONA_ORDER[@]}"
+eq "security is the only persona" 1 "${#PERSONA_ORDER[@]}"
 
 # --- signature ---
 SIG=$(signature claude-opus-5 security-audit)
@@ -108,17 +106,15 @@ contains "comment carries the findings" "$C" '### [P0] Fix the thing'
 contains "comment is signed with model and skill" "$C" \
   '*claude-opus-5 using security-audit on behalf of Yoshi*'
 
-CLEARED=$(render_comment hostile claude-opus-5 abc123 2026-08-26T09:00:00Z cleared 'Nothing left.')
-contains "cleared comment says cleared" "$CLEARED" '## Hostile review - cleared'
+CLEARED=$(render_comment security claude-opus-5 abc123 2026-08-26T09:00:00Z cleared 'Nothing left.')
+contains "cleared comment says cleared" "$CLEARED" '## Security review - cleared'
 contains "cleared comment records the verdict in state" "$CLEARED" 'verdict=cleared'
 
 # --- render_summary ---
-S=$(render_summary abc123 2026-08-26T09:00:00Z 2 '- security: cleared
-- simplicity: cleared
-- hostile: changes required')
-contains "summary reports the tally" "$S" '2/3 personas cleared'
+S=$(render_summary abc123 2026-08-26T09:00:00Z 0 '- security: changes required')
+contains "summary reports the tally" "$S" '0/1 personas cleared'
 contains "summary is a summary state block" "$S" 'persona=summary'
-contains "summary lists each persona" "$S" '- hostile: changes required'
+contains "summary lists each persona" "$S" '- security: changes required'
 
 # --- public repository redaction ---
 FINDING='### [P0] Reject unsigned tokens
@@ -146,8 +142,8 @@ contains "redaction with no report path still explains withholding" "$NOPATH" 'w
 PRIV=$(redact_findings security 0 "$FINDING")
 eq "private repos publish security findings in full" "$FINDING" "$PRIV"
 
-OTHER=$(redact_findings hostile 1 "$FINDING")
-eq "non-security personas publish in full on public repos" "$FINDING" "$OTHER"
+OTHER=$(redact_findings summary 1 "$FINDING")
+eq "non-security output publishes in full on public repos" "$FINDING" "$OTHER"
 
 CLEAN=$(redact_findings security 1 'No findings.')
 contains "redaction of a clean report still explains itself" "$CLEAN" 'withheld'
@@ -254,14 +250,14 @@ STUBEOF
 chmod +x "$STUB/bin/claude"
 echo 'task' >"$STUB/quietprompt"
 
-QUIET_ERR=$(run_persona hostile "$STUB" "$STUB/quietprompt" 2>&1 >/dev/null)
+QUIET_ERR=$(run_persona security "$STUB" "$STUB/quietprompt" 2>&1 >/dev/null)
 eq "a successful persona run emits nothing on stderr" "" "$QUIET_ERR"
 
-LOUD_ERR=$(STUB_CLAUDE_FAIL=1 run_persona hostile "$STUB" "$STUB/quietprompt" 2>&1 >/dev/null)
+LOUD_ERR=$(STUB_CLAUDE_FAIL=1 run_persona security "$STUB" "$STUB/quietprompt" 2>&1 >/dev/null)
 contains "a failed persona run surfaces the stderr it swallowed" "$LOUD_ERR" 'noisy warning'
-contains "a failed persona run labels whose stderr it is" "$LOUD_ERR" 'hostile'
+contains "a failed persona run labels whose stderr it is" "$LOUD_ERR" 'security'
 export STUB_CLAUDE_FAIL=1
-run_persona hostile "$STUB" "$STUB/quietprompt" >/dev/null 2>&1
+run_persona security "$STUB" "$STUB/quietprompt" >/dev/null 2>&1
 FAILRC=$?
 unset STUB_CLAUDE_FAIL
 eq "a failed persona run propagates non-zero" 1 "$FAILRC"
@@ -327,11 +323,11 @@ contains "prompt warns the output is public" "$SP" 'world-readable'
 contains "prompt forbids approving" "$SP" 'never approve'
 
 # --- task construction ---
-FIRST_TASK=$(build_persona_task hostile "" "")
-contains "first review names the skill" "$FIRST_TASK" 'hostile-review'
+FIRST_TASK=$(build_persona_task security "" "")
+contains "first review names the skill" "$FIRST_TASK" 'security-audit'
 lacks "first review has no resolution section" "$FIRST_TASK" 'RESOLVED'
 
-RETASK=$(build_persona_task hostile '### [P1] Old finding' 'author: I fixed it in abc123')
+RETASK=$(build_persona_task security '### [P1] Old finding' 'author: I fixed it in abc123')
 contains "re-review replays prior findings" "$RETASK" '### [P1] Old finding'
 contains "re-review replays the replies" "$RETASK" 'I fixed it in abc123'
 contains "re-review demands per-finding disposition" "$RETASK" 'RESOLVED'
@@ -403,7 +399,7 @@ chmod +x "$STUB/bin/claude"
 export STUB_ARGS="$STUB/claude-args"
 
 echo 'task text' >"$STUB/prompt"
-OUT=$(run_persona hostile "$QDIR" "$STUB/prompt")
+OUT=$(run_persona security "$QDIR" "$STUB/prompt")
 ARGS=$(cat "$STUB_ARGS")
 contains "run_persona output is returned" "$OUT" 'VERDICT: CLEARED'
 contains "invocation pins strict mcp config" "$ARGS" '--strict-mcp-config'
@@ -415,7 +411,7 @@ lacks "invocation must not grant Bash" "$ARGS" 'Bash'
 # run_persona must handle relative prompt paths (resolves to absolute before cd)
 echo 'task from relative' >"$STUB/rel-prompt"
 pushd "$STUB" >/dev/null || return 1
-OUT_REL=$(run_persona hostile "$QDIR" "rel-prompt")
+OUT_REL=$(run_persona security "$QDIR" "rel-prompt")
 popd >/dev/null || return 1
 contains "run_persona works with relative prompt path" "$OUT_REL" 'VERDICT: CLEARED'
 
@@ -444,7 +440,7 @@ COMMENTS='[
   "body":"<!-- pr-reviewer persona=security head=abc seen=x verdict=open -->\nold"},
  {"id":2,"user":{"login":"author"},"url":"u2","updated_at":"2026-08-26T11:00:00Z","body":"author: fixed it"},
  {"id":3,"user":{"login":"yoshi"},"url":"u3","updated_at":"2026-08-26T10:00:00Z",
-  "body":"<!-- pr-reviewer persona=hostile head=abc seen=x verdict=open -->\nold"}
+  "body":"<!-- pr-reviewer persona=summary head=abc seen=x verdict=open -->\nold"}
 ]'
 eq "newest_reply ignores the runner's own comments" \
   '2026-08-26T11:00:00Z' "$(newest_reply "$COMMENTS" "$RUNNER")"
@@ -452,7 +448,7 @@ eq "no human comments yields empty" "" "$(newest_reply '[]' "$RUNNER")"
 
 PC=$(persona_comment "$COMMENTS" security "$RUNNER")
 eq "persona_comment finds the right comment" u1 "$(jq -r .url <<<"$PC")"
-eq "persona_comment returns nothing when absent" "" "$(persona_comment "$COMMENTS" simplicity "$RUNNER")"
+eq "persona_comment returns nothing when absent" "" "$(persona_comment "$COMMENTS" bogus "$RUNNER")"
 
 # CRITICAL C1: an attacker-authored comment forging a state block (claiming a
 # false CLEARED verdict) must be invisible to persona_comment. Content alone
@@ -490,10 +486,10 @@ eq "a quoted reply is not mistaken for the runner's own persona comment" "" \
 # another's. Anchoring to the start of the body, not `contains`, is what fixes it.
 MIDBODY='[
  {"id":6,"user":{"login":"yoshi"},"url":"u6","updated_at":"2026-08-26T09:00:00Z",
-  "body":"<!-- pr-reviewer persona=security head=abc seen=x verdict=open -->\nSee also: <!-- pr-reviewer persona=hostile head=zzz seen=y verdict=cleared -->"}
+  "body":"<!-- pr-reviewer persona=security head=abc seen=x verdict=open -->\nSee also: <!-- pr-reviewer persona=summary head=zzz seen=y verdict=cleared -->"}
 ]'
 eq "a mid-body marker for another persona does not confuse selection" "" \
-  "$(persona_comment "$MIDBODY" hostile "$RUNNER")"
+  "$(persona_comment "$MIDBODY" summary "$RUNNER")"
 eq "the genuine leading marker is still found for its own persona" u6 \
   "$(jq -r .url <<<"$(persona_comment "$MIDBODY" security "$RUNNER")")"
 
@@ -619,13 +615,11 @@ case "$*" in
 VERDICT: CHANGES_REQUIRED
 FINDING
     ;;
-  *ponytail-review*) echo 'VERDICT: CLEARED' ;;
-  *hostile-review*) echo 'VERDICT: CLEARED' ;;
 esac
 STUBEOF
 chmod +x "$STUB/bin/claude"
 
-# --- Test A: nothing reviewed before, all three personas run, public repo ---
+# --- Test A: nothing reviewed before, security runs, public repo ---
 export STUB_HEAD_SHA=abc123
 export STUB_REPO_JSON='{"isPrivate":false}'
 export STUB_COMMENTS_FILE="$STUB/comments-empty.json"
@@ -638,16 +632,9 @@ OUT_A=$(review_pr yoshi/alpha 1 yoshi)
 
 contains "review_pr renders security's state block with the head sha" "$OUT_A" \
   'persona=security head=abc123'
-contains "review_pr renders simplicity's state block with the head sha" "$OUT_A" \
-  'persona=simplicity head=abc123'
-contains "review_pr renders hostile's state block with the head sha" "$OUT_A" \
-  'persona=hostile head=abc123'
-
 contains "security comment is signed" "$OUT_A" "$(signature "$CLAUDE_MODEL" security-audit)"
-contains "simplicity comment is signed" "$OUT_A" "$(signature "$CLAUDE_MODEL" ponytail-review)"
-contains "hostile comment is signed" "$OUT_A" "$(signature "$CLAUDE_MODEL" hostile-review)"
 
-contains "summary reports the correct tally" "$OUT_A" '2/3 personas cleared'
+contains "summary reports the correct tally" "$OUT_A" '0/1 personas cleared'
 
 lacks "public redaction hides the Problem text" "$OUT_A" 'SECRETDETAIL'
 lacks "public redaction hides the Fix text" "$OUT_A" 'SECRETFIX'
@@ -667,46 +654,34 @@ eq "the local security report is owner-readable only" 600 \
   "$(stat -c '%a' "$REPORT_PATH_A" 2>/dev/null)"
 contains "the public comment names the actual report path" "$OUT_A" "$REPORT_PATH_A"
 
-# --- Test B: hostile and simplicity already reviewed at this head with no new
-# replies (skipped), security never reviewed (runs); private repo this time ---
-HOSTILE_PRIOR=$(render_comment hostile "$CLAUDE_MODEL" abc123 "$NO_REPLIES" cleared 'Nothing left.')
-SIMPLICITY_PRIOR=$(render_comment simplicity "$CLAUDE_MODEL" abc123 "$NO_REPLIES" open \
-  '### [P2] Old finding')
-jq -n --arg h "$HOSTILE_PRIOR" --arg s "$SIMPLICITY_PRIOR" \
-  '[{id:10, user:{login:"yoshi"}, url:"https://api/comments/10", updated_at:"2026-08-26T09:00:00Z", body:$h},
-    {id:11, user:{login:"yoshi"}, url:"https://api/comments/11", updated_at:"2026-08-26T09:00:00Z", body:$s}]' \
-  >"$STUB/comments-mixed.json"
+# --- Test B: security already cleared against an older head, so the push
+# re-opens it; private repo this time, so nothing is redacted ---
+STALE_PRIOR=$(render_comment security "$CLAUDE_MODEL" oldsha "$NO_REPLIES" cleared 'Nothing left.')
+jq -n --arg b "$STALE_PRIOR" \
+  '[{id:10, user:{login:"yoshi"}, url:"https://api/comments/10", updated_at:"2026-08-26T09:00:00Z", body:$b}]' \
+  >"$STUB/comments-stale.json"
 
 export STUB_REPO_JSON='{"isPrivate":true}'
-export STUB_COMMENTS_FILE="$STUB/comments-mixed.json"
+export STUB_COMMENTS_FILE="$STUB/comments-stale.json"
 : >"$STUB_GH_LOG"
 : >"$STUB_CLAUDE_LOG"
 
 OUT_B=$(review_pr yoshi/alpha 1 yoshi)
 
-lacks "hostile is not re-invoked when skipped" "$(cat "$STUB_CLAUDE_LOG")" 'hostile-review'
-lacks "simplicity is not re-invoked when skipped" "$(cat "$STUB_CLAUDE_LOG")" 'ponytail-review'
-contains "security is invoked (never reviewed before)" "$(cat "$STUB_CLAUDE_LOG")" 'security-audit'
-
-contains "skipped persona's cleared verdict carries into the tally" "$OUT_B" '- hostile: cleared'
-contains "skipped persona's open verdict carries into the tally" "$OUT_B" '- simplicity: open'
-contains "freshly reviewed persona appears in the tally" "$OUT_B" '- security: open'
-contains "tally counts only the genuinely cleared persona" "$OUT_B" '1/3 personas cleared'
+contains "security is re-invoked after the head moves" "$(cat "$STUB_CLAUDE_LOG")" 'security-audit'
+contains "the re-review supersedes the stale cleared verdict" "$OUT_B" '- security: open'
+contains "tally reflects the reopened verdict" "$OUT_B" '0/1 personas cleared'
 
 contains "private repo publishes the finding in full (no redaction)" "$OUT_B" 'SECRETDETAIL'
 lacks "DRY_RUN never invokes gh with --method (test B)" "$(cat "$STUB_GH_LOG")" '--method'
 
 # --- an up-to-date PR reports rc 2, and explains itself only under VERBOSE ---
-# All three personas already carry the current head and have seen every reply,
-# so nothing is pending and review_pr must return early without invoking claude.
+# Security already carries the current head and has seen every reply, so
+# nothing is pending and review_pr must return early without invoking claude.
 cat >"$STUB/comments-current.json" <<'JSON'
 [
  {"id":1,"url":"u1","updated_at":"2026-08-26T09:00:00Z","user":{"login":"yoshi"},
-  "body":"<!-- pr-reviewer persona=security head=abc123 seen=1970-01-01T00:00:00Z verdict=cleared -->\nok"},
- {"id":2,"url":"u2","updated_at":"2026-08-26T09:00:00Z","user":{"login":"yoshi"},
-  "body":"<!-- pr-reviewer persona=simplicity head=abc123 seen=1970-01-01T00:00:00Z verdict=cleared -->\nok"},
- {"id":3,"url":"u3","updated_at":"2026-08-26T09:00:00Z","user":{"login":"yoshi"},
-  "body":"<!-- pr-reviewer persona=hostile head=abc123 seen=1970-01-01T00:00:00Z verdict=cleared -->\nok"}
+  "body":"<!-- pr-reviewer persona=security head=abc123 seen=1970-01-01T00:00:00Z verdict=cleared -->\nok"}
 ]
 JSON
 export STUB_COMMENTS_FILE="$STUB/comments-current.json"

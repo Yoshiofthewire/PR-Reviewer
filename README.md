@@ -1,20 +1,21 @@
 # PR Reviewer
 
 Reviews every open, non-draft pull request in repositories you own or that
-belong to an organization you are in. Each pull request is reviewed by three
-personas, and each persona posts and maintains its own comment.
+belong to an organization you are in. Each pull request is reviewed by the
+`security` persona, which posts and maintains its own comment.
 
 | Persona | Skill | Looks for |
 | --- | --- | --- |
 | `security` | `security-audit` | Exploitable defects the change introduces |
-| `simplicity` | `ponytail-review` | Over-engineering worth deleting |
-| `hostile` | `hostile-review` | Whatever a reviewer who hates the change would say |
 
-A persona re-reviews when the head SHA changes or when anyone replies after its
-last comment. It marks each prior finding RESOLVED, UNRESOLVED, or WITHDRAWN, so
-a correct rebuttal can clear a finding without a commit. When nothing actionable
-remains it reports CLEARED. A fourth comment tracks how many personas have
-cleared.
+The `simplicity` (`ponytail-review`) and `hostile` (`hostile-review`) personas
+were removed: they never cleared, so the gate was never passable.
+
+The persona re-reviews when the head SHA changes or when anyone replies after
+its last comment. It marks each prior finding RESOLVED, UNRESOLVED, or
+WITHDRAWN, so a correct rebuttal can clear a finding without a commit. When
+nothing actionable remains it reports CLEARED. A second comment tracks the
+tally.
 
 This never approves a pull request. It posts comments only, so no bot can
 satisfy branch protection and merging stays your decision.
