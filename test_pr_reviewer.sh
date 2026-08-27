@@ -148,6 +148,35 @@ eq "non-security output publishes in full on public repos" "$FINDING" "$OTHER"
 CLEAN=$(redact_findings security 1 'No findings.')
 contains "redaction of a clean report still explains itself" "$CLEAN" 'withheld'
 
+# The reference may be a board URL instead of a path; the withholding itself
+# must not weaken either way.
+BOARD=$(redact_findings security 1 "$FINDING" 'https://board.example/f/pr-reviewer-me-repo-1')
+lacks "board-backed redaction still hides the problem text" "$BOARD" 'SECRETDETAIL'
+contains "board-backed redaction names the board URL" "$BOARD" \
+  'https://board.example/f/pr-reviewer-me-repo-1'
+contains "board-backed redaction says where it went" "$BOARD" 'hand-off board'
+lacks "board-backed redaction does not claim a local file" "$BOARD" 'was written to'
+contains "board-backed redaction keeps the severity" "$BOARD" 'P0'
+
+# --- hand-off slugs and post bodies ---
+eq "slug is derived from repo and number" 'pr-reviewer-yoshi-alpha-1' \
+  "$(handoff_slug yoshi/alpha 1)"
+eq "slug lowercases and folds every illegal character" 'pr-reviewer-yo-shi-my-repo-name-12' \
+  "$(handoff_slug 'Yo_Shi/My.Repo_Name' 12)"
+LONGSLUG=$(handoff_slug "yoshi/$(printf 'a%.0s' {1..90})" 3)
+[[ ${#LONGSLUG} -le 64 ]] || fail "slug must be at most 64 chars, got ${#LONGSLUG}"
+[[ $LONGSLUG =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]] ||
+  fail "truncated slug must still be a legal slug, got '$LONGSLUG'"
+
+HB=$(handoff_post_body yoshi/alpha 1 abc123def456 opus open "$FINDING")
+contains "board post carries the unredacted finding" "$HB" 'SECRETDETAIL'
+contains "board post names the pull request" "$HB" 'https://github.com/yoshi/alpha/pull/1'
+contains "board post names the head sha" "$HB" 'abc123def456'
+contains "board post is signed" "$HB" "$(signature opus security-audit)"
+contains "board post states the verdict" "$HB" 'changes required'
+contains "cleared board post says cleared" \
+  "$(handoff_post_body yoshi/alpha 1 abc123 opus cleared 'Nothing left.')" 'cleared'
+
 # --- discovery, filtering, capping (gh is stubbed) ---
 STUB=$(mktemp -d)
 trap 'rm -rf "$STUB"' EXIT
@@ -155,6 +184,9 @@ mkdir -p "$STUB/bin"
 # pr-reviewer.sh derives SECURITY_REPORT_DIR from XDG_STATE_HOME at source time;
 # pin it under $STUB so the security-report tests never touch the real machine.
 export XDG_STATE_HOME="$STUB/xdg-state"
+# The operator's own shell exports these. Cleared so no test reaches the real
+# board; the hand-off tests below set them to a stub explicitly.
+unset HANDOFF_URL HANDOFF_TOKEN
 cat >"$STUB/bin/gh" <<'STUBEOF'
 #!/usr/bin/env bash
 case "$1 $2" in
@@ -594,6 +626,7 @@ case "$1 $2" in
   "repo view") echo "$STUB_REPO_JSON" ;;
   "api --paginate") cat "$STUB_COMMENTS_FILE" ;;
   "pr diff") printf 'diff --git a/x b/x\n+added line\n' ;;
+  "api --method") cat >>"$STUB_GH_LOG" ;;
 esac
 STUBEOF
 chmod +x "$STUB/bin/gh"
@@ -674,6 +707,77 @@ contains "tally reflects the reopened verdict" "$OUT_B" '0/1 personas cleared'
 
 contains "private repo publishes the finding in full (no redaction)" "$OUT_B" 'SECRETDETAIL'
 lacks "DRY_RUN never invokes gh with --method (test B)" "$(cat "$STUB_GH_LOG")" '--method'
+
+# --- Test C: public repo with the board configured; the full finding goes to
+# the board and the comment links there instead of naming a local path ---
+cat >"$STUB/bin/curl" <<'STUBEOF'
+#!/usr/bin/env bash
+# Records the request line and body, then answers like the board does: the
+# response, a newline, and the status code curl's -w '%{http_code}' appends.
+{ echo "REQUEST: $*"; cat; echo; } >>"$STUB_CURL_LOG"
+printf '{"id":1}\n%s' "${STUB_CURL_CODE:-200}"
+STUBEOF
+chmod +x "$STUB/bin/curl"
+export STUB_CURL_LOG="$STUB/curl.log"
+
+export STUB_HEAD_SHA=cafe1234
+export STUB_REPO_JSON='{"isPrivate":false}'
+export STUB_COMMENTS_FILE="$STUB/comments-empty.json"
+export HANDOFF_URL="https://board.example"
+export HANDOFF_TOKEN="stub-token"
+: >"$STUB_GH_LOG"
+: >"$STUB_CURL_LOG"
+DRY_RUN="" review_pr yoshi/alpha 1 yoshi >/dev/null 2>"$STUB/err-c"
+# A live tick posts the comment rather than printing it, so the assertions read
+# the body the gh stub received on stdin.
+OUT_C=$(cat "$STUB_GH_LOG")
+
+contains "the board folder is created for the PR" "$(cat "$STUB_CURL_LOG")" \
+  '/api/folders'
+contains "the review is posted into that folder" "$(cat "$STUB_CURL_LOG")" \
+  '/api/folders/pr-reviewer-yoshi-alpha-1/posts'
+contains "the board request carries the bearer token" "$(cat "$STUB_CURL_LOG")" \
+  'Bearer stub-token'
+contains "the board receives the unredacted finding" "$(cat "$STUB_CURL_LOG")" \
+  'SECRETDETAIL'
+contains "the public comment links to the board folder" "$OUT_C" \
+  'https://board.example/f/pr-reviewer-yoshi-alpha-1'
+lacks "the public comment still hides the problem text" "$OUT_C" 'SECRETDETAIL'
+lacks "the public comment names no local path" "$OUT_C" "$XDG_STATE_HOME"
+[[ -f $(security_report_path yoshi/alpha 1 cafe1234) ]] &&
+  fail "a delivered board post must not also write a local report"
+
+# CRITICAL: if the board rejects the post, the finding must still survive
+# locally and the comment must name where it actually went.
+export STUB_CURL_CODE=500
+export STUB_HEAD_SHA=beef5678
+: >"$STUB_CURL_LOG"
+: >"$STUB_GH_LOG"
+DRY_RUN="" review_pr yoshi/alpha 1 yoshi >/dev/null 2>"$STUB/err-cf"
+OUT_CF=$(cat "$STUB_GH_LOG")
+REPORT_PATH_CF=$(security_report_path yoshi/alpha 1 beef5678)
+contains "a failed board post is reported" "$(cat "$STUB/err-cf")" 'hand-off post failed'
+[[ -f $REPORT_PATH_CF ]] || fail "board failure must fall back to $REPORT_PATH_CF"
+contains "the fallback report holds the unredacted finding" \
+  "$(cat "$REPORT_PATH_CF" 2>/dev/null)" 'SECRETDETAIL'
+contains "the comment names the fallback path, not a board URL" "$OUT_CF" \
+  "$REPORT_PATH_CF"
+lacks "the comment does not claim a board post that failed" "$OUT_CF" 'board.example/f/'
+unset STUB_CURL_CODE
+
+# DRY_RUN must never touch the board: it is an outward-facing write.
+export STUB_HEAD_SHA=d00d9999
+: >"$STUB_CURL_LOG"
+OUT_CD=$(DRY_RUN=1 review_pr yoshi/alpha 1 yoshi 2>"$STUB/err-cd")
+eq "dry run never calls the board" "" "$(cat "$STUB_CURL_LOG")"
+contains "dry run says where the finding would have gone" "$(cat "$STUB/err-cd")" \
+  'would post the full finding'
+contains "dry run still delivers the finding locally" "$OUT_CD" \
+  "$(security_report_path yoshi/alpha 1 d00d9999)"
+
+unset HANDOFF_URL HANDOFF_TOKEN
+export STUB_HEAD_SHA=abc123
+export DRY_RUN=1
 
 # --- an up-to-date PR reports rc 2, and explains itself only under VERBOSE ---
 # Security already carries the current head and has seen every reply, so

@@ -33,8 +33,20 @@
 - Keep exactly one comment per persona per pull request, plus one summary.
 - Findings carry severity, a changed-file location, failure mode, fix direction,
   and verification.
-- Sign every comment `<model> using <skill> on behalf of Yoshi`.
+- Every comment, note, or reply posted into a pull request must identify the
+  model and say it is posting for Yoshi, not as Yoshi. Sign it
+  `<model> using <skill> on behalf of Yoshi` and never write as though Yoshi
+  authored the text. This covers persona comments, the summary, and any ad-hoc
+  note a run adds; a reader must never have to guess whether a human wrote it.
 - On public repositories the `security` persona publishes severity and file only.
+  The unredacted finding goes to the hand-off board when `HANDOFF_URL` and
+  `HANDOFF_TOKEN` are set, and to a mode-600 local file otherwise, on a board
+  failure, or under `DRY_RUN`. The comment must name the route that actually
+  succeeded; never claim a destination that was not written.
+- The board is a delivery channel, not the record: everything there expires
+  seven days after a folder's last post. Nothing may depend on reading it back,
+  and review state stays in the GitHub comment.
+- `DRY_RUN` must make no outward-facing write, so it never posts to the board.
 - Never review archived repositories or draft pull requests.
 - `WORK_DIR` basename must be exactly `pr-reviewer`; the reaper refuses to delete
   from directories it cannot confirm are its own, because earlier versions would
@@ -42,7 +54,8 @@
 
 ## Work Guidance
 
-- Reach for `gh`, `jq`, `git`, and `claude`. Add no other dependencies.
+- Reach for `gh`, `jq`, `git`, `claude`, and `curl` (board posting only). Add no
+  other dependencies.
 - Run without `set -e`; propagate errors with explicit `|| return 1`.
 - Isolate failures per pull request. One bad pull request must not end the tick.
 - Ticks must be idempotent. Reap stale checkouts rather than assuming the last

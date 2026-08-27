@@ -76,19 +76,28 @@ visibility_flag() { # visibility_flag <gh repo view --json isPrivate output>
 
 # Publishing an exploitable finding against an unfixed public branch is
 # uncoordinated disclosure, so public security reports name severity and file only.
-# <local-report-path> must be the actual path the caller wrote the full finding
-# to, or empty if that write failed; this function performs no I/O itself.
-redact_findings() { # redact_findings <persona> <is-public 0|1> <body> [local-report-path]
-  local persona="$1" public="$2" body="$3" path="${4:-}" line sev="P?" file
+# <report-reference> must be where the caller actually delivered the full finding
+# -- a hand-off board URL or a local path -- or empty if every route failed; this
+# function performs no I/O itself and never checks that the reference resolves.
+redact_findings() { # redact_findings <persona> <is-public 0|1> <body> [report-reference]
+  local persona="$1" public="$2" body="$3" ref="${4:-}" line sev="P?" file
+  local withheld='Detail withheld: this repository is public, and posting an unfixed finding here would be public disclosure.'
   if [[ $persona != security || $public != 1 ]]; then
     printf '%s' "$body"
     return 0
   fi
-  if [[ -n $path ]]; then
-    printf 'Detail withheld: this repository is public, and posting an unfixed finding here would be public disclosure. The full report was written to `%s`.\n' "$path"
-  else
-    printf 'Detail withheld: this repository is public, and posting an unfixed finding here would be public disclosure. The full report could not be written locally; check the operator logs.\n'
-  fi
+  case $ref in
+    http://*|https://*)
+      printf '%s The full report was posted to the hand-off board at %s, where it is readable by the operator and expires seven days after the last post.\n' \
+        "$withheld" "$ref"
+      ;;
+    ?*)
+      printf '%s The full report was written to `%s`.\n' "$withheld" "$ref"
+      ;;
+    *)
+      printf '%s The full report could not be delivered anywhere; check the operator logs.\n' "$withheld"
+      ;;
+  esac
   while IFS= read -r line; do
     if [[ $line =~ ^\#\#\#[[:space:]]\[(P[0-9])\] ]]; then
       sev="${BASH_REMATCH[1]}"
@@ -98,6 +107,30 @@ redact_findings() { # redact_findings <persona> <is-public 0|1> <body> [local-re
     fi
   done <<<"$body"
   printf '\n'
+}
+
+# Board slugs are lowercase letters, digits and hyphens, must start with a
+# letter or digit, and are capped at 64 characters. One folder per pull request:
+# a re-review appends a post to the same folder rather than opening a new one.
+handoff_slug() { # handoff_slug <repo> <number>
+  local slug
+  slug=$(printf 'pr-reviewer-%s-%s' "$1" "$2" |
+    tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//')
+  slug=${slug:0:64}
+  while [[ $slug == *- ]]; do slug=${slug%-}; done
+  printf '%s' "$slug"
+}
+
+# The board post carries what the public comment cannot: the finding in full.
+# It names the pull request and head sha because the reader arrives from the
+# board, with no idea which review this is.
+handoff_post_body() { # handoff_post_body <repo> <number> <head> <model> <verdict> <body>
+  local repo="$1" number="$2" head="$3" model="$4" verdict="$5" body="$6" status
+  status="changes required"
+  [[ $verdict == cleared ]] && status="cleared"
+  printf '## %s#%s - security review %s\n\n- Pull request: https://github.com/%s/pull/%s\n- Head: `%s`\n\nThe pull request is public, so its comment names severity and file only. The finding in full:\n\n%s\n\n---\n%s\n' \
+    "$repo" "$number" "$status" "$repo" "$number" "$head" "$body" \
+    "$(signature "$model" "${PERSONA_SKILL[security]}")"
 }
 
 # Why repo_allowed rejected a repo. Logging only; never gates behaviour.

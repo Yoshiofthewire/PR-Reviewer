@@ -249,6 +249,9 @@ upsert_comment() { # upsert_comment <repo> <number> <comment-url> <body-file>
   fi
 }
 
+HANDOFF_URL="${HANDOFF_URL:-}"
+HANDOFF_TOKEN="${HANDOFF_TOKEN:-}"
+
 SECURITY_REPORT_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/pr-reviewer"
 
 security_report_path() { # security_report_path <repo> <number> <sha>
@@ -268,10 +271,74 @@ write_security_report() { # write_security_report <path> <body>
   return 0
 }
 
+# One request against the board. The JSON body arrives on stdin so a token or a
+# finding never lands in the process table; the bearer header cannot avoid argv,
+# which is why the board is only ever reached from the operator's own machine.
+handoff_api() { # handoff_api <method> <path>  (JSON body on stdin)
+  local method="$1" path="$2" out code detail
+  out=$(curl -sS --max-time 30 -w '\n%{http_code}' -X "$method" \
+    -H "Authorization: Bearer $HANDOFF_TOKEN" -H 'Content-Type: application/json' \
+    --data-binary @- "$HANDOFF_URL$path") || return 1
+  code=${out##*$'\n'}
+  [[ $code == 2* ]] && return 0
+  detail=$(jq -r '.detail? // empty' <<<"${out%$'\n'*}" 2>/dev/null)
+  echo "ERROR: hand-off $method $path returned ${code:-no status}: ${detail:-no detail}" >&2
+  return 1
+}
+
+# Creates the pull request's folder (idempotent) and appends this review to it.
+# Echoes the folder URL an operator can open, or nothing if any call failed.
+post_handoff() { # post_handoff <repo> <number> <head> <verdict> <body>
+  local repo="$1" number="$2" head="$3" verdict="$4" body="$5" slug status
+  command -v curl >/dev/null ||
+    { echo "ERROR: curl is required to post to the hand-off board" >&2; return 1; }
+  slug=$(handoff_slug "$repo" "$number")
+  status=open
+  [[ $verdict == cleared ]] && status="done"
+  jq -n --arg slug "$slug" --arg title "$repo#$number security review" \
+    '{slug: $slug, title: $title}' |
+    handoff_api POST "/api/folders" || return 1
+  jq -n --arg title "$repo#$number security review @ ${head:0:8}" \
+        --arg note "$CLAUDE_MODEL/$REASONING_EFFORT via pr-reviewer" \
+        --arg body "$body" --arg status "$status" \
+    '{title: $title, format: "md", author_note: $note, body: $body, status: $status}' |
+    handoff_api POST "/api/folders/$slug/posts" || return 1
+  printf '%s/f/%s' "$HANDOFF_URL" "$slug"
+}
+
+# The unredacted finding has to reach the operator somewhere, because the public
+# comment deliberately withholds it. The board first: the operator reads it in a
+# browser from any machine. The local file otherwise -- board unconfigured,
+# unreachable, or a dry run, which must not write to anything outward-facing.
+# Echoes the reference the comment should name, or nothing if both routes failed.
+deliver_full_finding() { # deliver_full_finding <repo> <number> <head> <verdict> <body>
+  local repo="$1" number="$2" head="$3" verdict="$4" body="$5" url path
+  if [[ -n $HANDOFF_URL && -n $HANDOFF_TOKEN ]]; then
+    if [[ -n ${DRY_RUN:-} ]]; then
+      echo "would post the full finding for $repo#$number to $HANDOFF_URL/f/$(handoff_slug "$repo" "$number")" >&2
+    elif url=$(post_handoff "$repo" "$number" "$head" "$verdict" \
+        "$(handoff_post_body "$repo" "$number" "$head" "$CLAUDE_MODEL" "$verdict" "$body")"); then
+      echo "full finding for $repo#$number posted to $url" >&2
+      printf '%s' "$url"
+      return 0
+    else
+      echo "ERROR $repo#$number security: hand-off post failed; falling back to a local report" >&2
+    fi
+  fi
+  path=$(security_report_path "$repo" "$number" "$head")
+  if write_security_report "$path" "$body"; then
+    echo "security report for $repo#$number written to $path" >&2
+    printf '%s' "$path"
+    return 0
+  fi
+  echo "ERROR $repo#$number security: failed to write local report to $path" >&2
+  return 1
+}
+
 review_pr() { # review_pr <repo> <number> <runner-login>
   local repo="$1" number="$2" runner="$3"
   local head_sha comments newest dir persona pc body_text state_head state_seen
-  local prior url out verdict body stripped report_path cleared=0 lines="" truncated="" rc=0 repo_json
+  local prior url out verdict body stripped report_ref cleared=0 lines="" truncated="" rc=0 repo_json
   local t0
   local -A VERDICTS=()
   local pending=()
@@ -342,15 +409,9 @@ review_pr() { # review_pr <repo> <number> <runner-login>
     VERDICTS[$persona]=$verdict
     stripped=$(strip_verdict "$out")
     if [[ $persona == security && $IS_PUBLIC == 1 ]]; then
-      report_path=$(security_report_path "$repo" "$number" "$head_sha")
-      if write_security_report "$report_path" "$stripped"; then
-        echo "security report for $repo#$number written to $report_path" >&2
-      else
-        echo "ERROR $repo#$number security: failed to write local report to $report_path" >&2
-        report_path=""
+      report_ref=$(deliver_full_finding "$repo" "$number" "$head_sha" "$verdict" "$stripped") ||
         rc=1
-      fi
-      body=$(redact_findings "$persona" "$IS_PUBLIC" "$stripped" "$report_path")
+      body=$(redact_findings "$persona" "$IS_PUBLIC" "$stripped" "$report_ref")
     else
       body=$(redact_findings "$persona" "$IS_PUBLIC" "$stripped")
     fi

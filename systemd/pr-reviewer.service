@@ -9,3 +9,7 @@ Type=oneshot
 ExecStart=%h/git/PR-Reviewer/pr-reviewer.sh
 WorkingDirectory=%h/git/PR-Reviewer
 Environment=MAX_PRS_PER_TICK=5
+# HANDOFF_URL and HANDOFF_TOKEN for the hand-off board, if you post findings
+# there. Optional (leading '-'): the tick falls back to a local report file.
+# Keep it mode 600; it holds a bearer token.
+EnvironmentFile=-%h/.config/pr-reviewer/env

@@ -22,7 +22,8 @@ satisfy branch protection and merging stays your decision.
 
 ## Setup
 
-Requires `gh`, `jq`, `git`, and the `claude` CLI. `gh` must be logged in with
+Requires `gh`, `jq`, `git`, and the `claude` CLI, plus `curl` if you post
+findings to a hand-off board. `gh` must be logged in with
 `repo` and `read:org`:
 
 ```sh
@@ -45,6 +46,8 @@ logs with `journalctl --user -u pr-reviewer.service`.
 | `MAX_PRS_PER_TICK` | 5 | Pull requests reviewed per tick; the rest are logged and deferred |
 | `MAX_DIFF_BYTES` | 180000 | Diff truncation threshold in bytes; truncation is stated in the comment |
 | `DRY_RUN` | unset | Print comment bodies instead of posting them |
+| `HANDOFF_URL` | empty | Hand-off board base URL; unset means deliver full findings to a local file instead |
+| `HANDOFF_TOKEN` | empty | Bearer token for that board; both must be set for board delivery |
 | `CLAUDE_MODEL` | `opus` | Model for every persona |
 | `REASONING_EFFORT` | `high` | Effort for every persona |
 | `WORK_DIR` | `$XDG_RUNTIME_DIR/pr-reviewer`, or `/tmp/pr-reviewer` | Throwaway checkout directory; basename must be `pr-reviewer` because the reaper refuses to delete from directories it cannot confirm are its own |
@@ -79,11 +82,40 @@ the model, owns the comment envelope and signature.
 
 On public repositories the `security` persona posts severity and file only.
 Posting an unfixed exploitable finding to a public comment is disclosure. The
-full finding is written locally to
-`${XDG_STATE_HOME:-$HOME/.local/state}/pr-reviewer/<owner>-<repo>-<number>-<sha>.md`,
-mode 600, before redaction. This also happens under `DRY_RUN`, since a
-dry-running operator still needs to see the withheld detail; the comment names
-the actual path, or says the write failed rather than claiming a file exists.
+full finding is delivered out of band instead, and the comment names wherever it
+actually went — never an empty promise that something exists.
+
+Delivery order:
+
+1. **The hand-off board (MySlop)**, when `HANDOFF_URL` and `HANDOFF_TOKEN` are
+   set. One folder per pull request (`pr-reviewer-<owner>-<repo>-<number>`); each
+   review appends a post to it, so the folder reads as that pull request's
+   history. The comment links to the folder. The board is login-gated for the
+   human, and its content **expires seven days after the last post** — it is a
+   delivery channel, not the record.
+2. **A local file**, when the board is unconfigured, when a board call fails, or
+   under `DRY_RUN` (posting is an outward-facing write, so a dry run never makes
+   one). Written to
+   `${XDG_STATE_HOME:-$HOME/.local/state}/pr-reviewer/<owner>-<repo>-<number>-<sha>.md`,
+   mode 600, before redaction. A dry run says on stderr where the post would have
+   gone.
+
+If both routes fail, the comment says the report could not be delivered and the
+tick reports a failure.
+
+Set the board credentials where the timer can read them but other users cannot:
+
+```sh
+mkdir -p ~/.config/pr-reviewer
+cat >~/.config/pr-reviewer/env <<'EOF'
+HANDOFF_URL=https://myslop.example
+HANDOFF_TOKEN=<the UUID minted for this machine>
+EOF
+chmod 600 ~/.config/pr-reviewer/env
+```
+
+`systemd/pr-reviewer.service` reads that file if it exists and starts fine
+without it.
 
 Every invocation takes an flock at `${XDG_STATE_HOME:-$HOME/.local/state}/pr-reviewer.lock`
 before doing any work, whether started by the timer or run directly, so a slow
