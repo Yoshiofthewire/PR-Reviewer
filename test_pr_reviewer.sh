@@ -2,6 +2,16 @@
 # Dependency-free checks for review logic. No network, no writes outside TMPDIR.
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1
+
+# Same guard as pr-reviewer.sh, and for the same reason: sourcing review-core.sh
+# under macOS's bash 3.2 fails on its associative arrays. Must precede the source.
+if [[ ${BASH_VERSINFO[0]:-0} -lt 4 ]]; then
+  for _newer in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [[ -x $_newer ]] && exec "$_newer" "$0" "$@"
+  done
+  echo "ERROR: bash 4+ required (found ${BASH_VERSION:-unknown}); run 'brew install bash'" >&2
+  exit 1
+fi
 # shellcheck source=lib/review-core.sh
 source ./lib/review-core.sh
 
