@@ -2,6 +2,17 @@
 # Review open pull requests locally through the security persona reviewer.
 set -uo pipefail
 
+# macOS ships bash 3.2, which has neither `mapfile` nor associative arrays, and
+# `env bash` finds it first unless Homebrew's bin precedes /bin on PATH. Re-exec
+# under a newer bash before sourcing anything that needs one.
+if [[ ${BASH_VERSINFO[0]:-0} -lt 4 ]]; then
+  for _newer in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [[ -x $_newer ]] && exec "$_newer" "$0" "$@"
+  done
+  echo "ERROR: bash 4+ required (found ${BASH_VERSION:-unknown}); run 'brew install bash'" >&2
+  exit 1
+fi
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib/review-core.sh
 source "$SCRIPT_DIR/lib/review-core.sh"
@@ -427,6 +438,10 @@ if [[ ${BASH_SOURCE[0]:-} == "$0" ]]; then
   if [[ -z ${PR_REVIEWER_LOCKED:-} ]]; then
     LOCK_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/pr-reviewer.lock"
     mkdir -p "$(dirname "$LOCK_FILE")" || exit 1
+    # macOS ships no flock. Fail loudly here rather than letting exec die with a
+    # bare "command not found" and leaving the tick unserialised.
+    command -v flock >/dev/null ||
+      { echo "ERROR: flock is required; run 'brew install flock'" >&2; exit 1; }
     exec env PR_REVIEWER_LOCKED=1 flock -n "$LOCK_FILE" "$0" "$@"
   fi
   main "$@"
