@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template. install.sh substitutes @SCRIPT@, @DIR@, @BASH@, @PATH@ and @LOG@. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.urlxl.pr-reviewer</string>
+
+  <!-- Invoked through an explicit bash 4+ rather than the shebang, because
+       launchd's PATH would otherwise resolve `env bash` to macOS's 3.2. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BASH@</string>
+    <string>@SCRIPT@</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>@DIR@</string>
+
+  <!-- Five minutes, matching the systemd timer. launchd skips ticks while the
+       machine is asleep and fires once on wake; it does not replay the backlog. -->
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>@PATH@</string>
+    <key>MAX_PRS_PER_TICK</key>
+    <string>5</string>
+  </dict>
+
+  <!-- There is no journalctl here, so the tick's stderr goes to a file. -->
+  <key>StandardOutPath</key>
+  <string>@LOG@</string>
+  <key>StandardErrorPath</key>
+  <string>@LOG@</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>
