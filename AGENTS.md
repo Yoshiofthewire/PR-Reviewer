@@ -15,7 +15,8 @@
   `claude` on `PATH`; it never reaches the network.
 - `verify_isolation.sh` owns proof that the sandboxing still holds. It costs
   tokens and is never run by the tick or the test suite.
-- `systemd/` and `install.sh` own scheduling.
+- `systemd/` (Linux) and `launchd/` (macOS) own the unit definitions;
+  `install.sh` branches on `uname -s` and owns installing whichever applies.
 - `README.md` owns operator setup.
 
 ## Local Contracts
@@ -36,6 +37,14 @@
 - Sign every comment `<model> using <skill> on behalf of Yoshi`.
 - On public repositories the `security` persona publishes severity and file only.
 - Never review archived repositories or draft pull requests.
+- The tick needs bash 4+ (`mapfile`, associative arrays) and `flock`. macOS has
+  neither by default, so `pr-reviewer.sh` re-execs under a Homebrew bash and
+  refuses to run unserialised if `flock` is absent. Keep both guards ahead of
+  the `source` and the lock respectively, or macOS fails obscurely instead of
+  loudly.
+- Keep the test suite free of GNU-only invocations. BSD `wc -l` pads its count
+  and BSD `stat` takes different flags, so both go through the `lines` and
+  `mode` helpers.
 - `WORK_DIR` basename must be exactly `pr-reviewer`; the reaper refuses to delete
   from directories it cannot confirm are its own, because earlier versions would
   happily wipe operator files if pointed anywhere broad.

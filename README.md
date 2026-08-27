@@ -22,19 +22,31 @@ satisfy branch protection and merging stays your decision.
 
 ## Setup
 
-Requires `gh`, `jq`, `git`, and the `claude` CLI. `gh` must be logged in with
-`repo` and `read:org`:
+Requires `gh`, `jq`, `git`, `flock`, the `claude` CLI, and bash 4+. `gh` must be
+logged in with `repo` and `read:org`:
 
 ```sh
+brew install bash flock          # macOS only; it ships bash 3.2 and no flock
 gh auth login
 ./verify_isolation.sh   # proves the sandboxing still holds; costs a few tokens
 DRY_RUN=1 ./pr-reviewer.sh
 ./install.sh
 ```
 
-`install.sh` enables a systemd user timer that runs a tick every five minutes.
-Run one on demand with `systemctl --user start pr-reviewer.service`, and read the
-logs with `journalctl --user -u pr-reviewer.service`.
+`install.sh` installs a five-minute tick for the platform it is run on.
+
+| | Linux | macOS |
+| --- | --- | --- |
+| Mechanism | systemd user timer | launchd user agent, `com.urlxl.pr-reviewer` |
+| Run one now | `systemctl --user start pr-reviewer.service` | `launchctl kickstart -k gui/$UID/com.urlxl.pr-reviewer` |
+| Logs | `journalctl --user -u pr-reviewer.service` | `tail -f ~/Library/Logs/pr-reviewer.log` |
+| Stop it | `systemctl --user disable --now pr-reviewer.timer` | `launchctl bootout gui/$UID/com.urlxl.pr-reviewer` |
+
+macOS notes: `env bash` finds the 3.2 that ships with the OS unless Homebrew's
+`bin` precedes `/bin` on `PATH`, so `pr-reviewer.sh` re-execs itself under a
+newer bash and the launchd agent invokes one explicitly. launchd does not run
+while the machine is asleep and does not replay the ticks it missed; it fires
+once on wake.
 
 ## Configuration
 
