@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 # Dependency-free checks for review logic. No network, no writes outside TMPDIR.
 set -uo pipefail
+
+# macOS ships bash 3.2, which has no associative arrays, so review-core.sh's
+# PERSONA_* tables fail to parse under it. Whether `env bash` finds a modern
+# bash depends on PATH order, which differs between the launchd job and an
+# operator's interactive shell -- so locate one here and re-exec, rather than
+# dying with an unbound-variable error from inside a sourced file.
+if [[ ${BASH_VERSINFO[0]:-0} -lt 4 ]]; then
+  if [[ -z ${PR_REVIEWER_BASH_REEXEC:-} ]]; then
+    for _bash in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+      [[ -x $_bash ]] && exec env PR_REVIEWER_BASH_REEXEC=1 "$_bash" "$0" "$@"
+    done
+  fi
+  echo "ERROR: bash 4+ is required (running ${BASH_VERSION:-unknown}); install one, e.g. 'brew install bash'" >&2
+  exit 1
+fi
 cd "$(dirname "$0")" || exit 1
 # shellcheck source=lib/review-core.sh
 source ./lib/review-core.sh
@@ -18,6 +33,17 @@ rc() { # rc <desc> <want-rc> <command...>
   "$@"
   local got=$?
   [[ $got -eq $want ]] || fail "$desc (want rc $want, got rc $got)"
+}
+
+# BSD wc pads its count with spaces and GNU wc does not, so every comparison
+# against a line count goes through here rather than through `wc -l` directly.
+lines_of() { # lines_of <text>
+  grep -c '' <<<"$1"
+}
+
+# BSD stat and GNU stat spell the octal-mode format differently; try both.
+file_mode() { # file_mode <path>
+  stat -f '%OLp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null
 }
 
 contains() { # contains <desc> <haystack> <needle>
@@ -186,7 +212,7 @@ mkdir -p "$STUB/bin"
 export XDG_STATE_HOME="$STUB/xdg-state"
 # The operator's own shell exports these. Cleared so no test reaches the real
 # board; the hand-off tests below set them to a stub explicitly.
-unset HANDOFF_URL HANDOFF_TOKEN
+HANDOFF_URL="" HANDOFF_TOKEN=""  # as pr-reviewer.sh defines them when unconfigured
 cat >"$STUB/bin/gh" <<'STUBEOF'
 #!/usr/bin/env bash
 case "$1 $2" in
@@ -221,14 +247,14 @@ eq "resolve_owners lists the user and every org" \
 REPOSITORIES="" EXCLUDE_REPOSITORIES="yoshi/skipme" MAX_PRS_PER_TICK=10
 OUT=$(discover_prs 2>/dev/null)
 lacks "denylisted repo is filtered out" "$OUT" 'skipme'
-eq "three PRs survive the filter" 3 "$(wc -l <<<"$OUT")"
+eq "three PRs survive the filter" 3 "$(lines_of "$OUT")"
 eq "newest updatedAt sorts first" 'yoshi/beta' "$(head -1 <<<"$OUT" | cut -f1)"
 eq "oldest updatedAt sorts last" 'yoshi/alpha' "$(tail -1 <<<"$OUT" | cut -f1)"
 
 # shellcheck disable=SC2034  # REPOSITORIES, EXCLUDE_REPOSITORIES, MAX_PRS_PER_TICK used by discover_prs
 REPOSITORIES="" EXCLUDE_REPOSITORIES="" MAX_PRS_PER_TICK=2
 CAPPED=$(discover_prs 2>"$STUB/err")
-eq "cap limits the batch" 2 "$(wc -l <<<"$CAPPED")"
+eq "cap limits the batch" 2 "$(lines_of "$CAPPED")"
 contains "capped PRs are named on stderr" "$(cat "$STUB/err")" 'yoshi/alpha#1'
 
 STUB_ORGS_FAIL=1 rc "discover_prs fails when org lookup fails" 1 discover_prs
@@ -320,7 +346,7 @@ export STUB_GH_ARGS_LOG="$STUB/gh-args.log"
 REPOSITORIES="" EXCLUDE_REPOSITORIES="" MAX_PRS_PER_TICK=1000
 FULL=$(discover_prs 2>"$STUB/err100")
 eq "all 100 discovered PRs pass through when the cap is high enough" \
-  100 "$(wc -l <<<"$FULL")"
+  100 "$(lines_of "$FULL")"
 contains "discovery requests a deterministic newest-first sort" \
   "$(cat "$STUB_GH_ARGS_LOG")" '--sort updated --order desc'
 contains "hitting the query limit is logged, not silently dropped" \
@@ -559,6 +585,67 @@ SELF_MIXED='[
 eq "the marker-led comment is excluded even though it is newer than the reply" \
   '2026-08-26T11:00:00Z' "$(newest_reply "$SELF_MIXED" "$RUNNER")"
 
+# --- review-thread replies (inline comments and review submissions) ---
+# A reply typed in the Files-changed tab is not an issue comment. Before these
+# sources were merged, answering a finding inline left the persona seeing no
+# reply at all: it never re-ran, and the finding could never be withdrawn.
+ISSUE_ONLY='[
+ {"id":1,"user":{"login":"author"},"url":"u1","updated_at":"2026-08-26T09:00:00Z",
+  "body":"plain issue comment"}
+]'
+THREADS='[
+ {"id":2,"user":{"login":"author"},"path":"auth/verify.go","line":88,
+  "updated_at":"2026-08-26T12:00:00Z","body":"the verifier rejects alg=none already"}
+]'
+REVIEWS='[
+ {"user":{"login":"author"},"state":"CHANGES_REQUESTED",
+  "submitted_at":"2026-08-26T13:00:00Z","body":"see my inline note"},
+ {"user":{"login":"someone"},"state":"APPROVED",
+  "submitted_at":"2026-08-26T14:00:00Z","body":""}
+]'
+MERGED=$(merge_reply_sources "$ISSUE_ONLY" "$THREADS" "$REVIEWS")
+# 14:00 is the bodiless approval: it must not count as a reply that says
+# nothing, or every approval would buy a full re-review with no text to judge.
+eq "the newest reply comes from the review submission, not the empty approval" \
+  '2026-08-26T13:00:00Z' "$(newest_reply "$MERGED" "$RUNNER")"
+MERGED_BODIES=$(reply_bodies "$MERGED" "" "$RUNNER")
+contains "an inline comment's text reaches the persona" "$MERGED_BODIES" \
+  'rejects alg=none already'
+contains "an inline comment names the line it hangs off" "$MERGED_BODIES" \
+  'auth/verify.go:88'
+contains "a review submission's text reaches the persona" "$MERGED_BODIES" \
+  'see my inline note'
+contains "a review submission names its state" "$MERGED_BODIES" 'CHANGES_REQUESTED'
+lacks "a bodiless approval contributes no empty reply" "$MERGED_BODIES" 'APPROVED'
+rc "an inline reply newer than seen demands re-review" 0 \
+  needs_review abc '2026-08-26T10:00:00Z' abc "$(newest_reply "$MERGED" "$RUNNER")"
+
+# Merging must not weaken the identity rules: the bot's own marker-led issue
+# comment stays excluded, so the new sources cannot start a self-review loop.
+eq "the bot's own comment is still excluded after merging" "" \
+  "$(newest_reply "$(merge_reply_sources "$ONLY_BOT" '' '')" "$RUNNER")"
+# The runner IS the PR author on a solo repo, and its inline replies carry no
+# marker (they cannot: the location prefix leads), so they must all count.
+SELF_THREAD='[
+ {"id":3,"user":{"login":"yoshi"},"path":"a.go","line":2,
+  "updated_at":"2026-08-26T15:00:00Z","body":"false positive, validated upstream"}
+]'
+eq "the runner's own inline reply counts as a reply" '2026-08-26T15:00:00Z' \
+  "$(newest_reply "$(merge_reply_sources '[]' "$SELF_THREAD" '')" "$RUNNER")"
+
+eq "an empty source contributes nothing" "" \
+  "$(newest_reply "$(merge_reply_sources '[]' '' '')" "$RUNNER")"
+
+# gh --paginate emits one array PER PAGE. Unflattened, jq answers once per page:
+# newest_reply would print two timestamps and persona_comment two objects, so
+# the bot would post a duplicate comment instead of patching its own.
+PAGED='[{"id":1,"user":{"login":"author"},"url":"u1","updated_at":"2026-08-26T09:00:00Z","body":"page one"}]
+[{"id":2,"user":{"login":"author"},"url":"u2","updated_at":"2026-08-26T12:00:00Z","body":"page two"}]'
+eq "paginated pages flatten into a single answer" '2026-08-26T12:00:00Z' \
+  "$(newest_reply "$(flatten_pages "$PAGED")" "$RUNNER")"
+eq "flattening an already-flat array is a no-op" '2026-08-26T11:00:00Z' \
+  "$(newest_reply "$(flatten_pages "$COMMENTS")" "$RUNNER")"
+
 # --- DRY_RUN must not call gh ---
 cat >"$STUB/bin/gh" <<'STUBEOF'
 #!/usr/bin/env bash
@@ -624,7 +711,14 @@ echo "$*" >>"$STUB_GH_LOG"
 case "$1 $2" in
   "pr view") echo "$STUB_HEAD_SHA" ;;
   "repo view") echo "$STUB_REPO_JSON" ;;
-  "api --paginate") cat "$STUB_COMMENTS_FILE" ;;
+  # The three reply endpoints answer separately: a stub that returned the same
+  # file for all of them would hide a caller that fetched the wrong one.
+  "api --paginate")
+    case "$3" in
+      */issues/*/comments) cat "$STUB_COMMENTS_FILE" ;;
+      */pulls/*/comments) cat "${STUB_THREADS_FILE:-/dev/null}" ;;
+      */pulls/*/reviews) cat "${STUB_REVIEWS_FILE:-/dev/null}" ;;
+    esac ;;
   "pr diff") printf 'diff --git a/x b/x\n+added line\n' ;;
   "api --method") cat >>"$STUB_GH_LOG" ;;
 esac
@@ -636,7 +730,10 @@ chmod +x "$STUB/bin/gh"
 # so a persona that should be skipped this tick would show up here if it ran.
 cat >"$STUB/bin/claude" <<'STUBEOF'
 #!/usr/bin/env bash
+# Args AND the prompt on stdin: the prompt is where reply text has to land, so
+# a reply the runner fetched but never passed on would otherwise pass unnoticed.
 echo "$*" >>"$STUB_CLAUDE_LOG"
+cat >>"$STUB_CLAUDE_LOG"
 case "$*" in
   *security-audit*)
     cat <<'FINDING'
@@ -684,7 +781,7 @@ REPORT_PATH_A=$(security_report_path yoshi/alpha 1 abc123)
 contains "the local security report holds the unredacted finding" \
   "$(cat "$REPORT_PATH_A" 2>/dev/null)" 'SECRETDETAIL'
 eq "the local security report is owner-readable only" 600 \
-  "$(stat -c '%a' "$REPORT_PATH_A" 2>/dev/null)"
+  "$(file_mode "$REPORT_PATH_A")"
 contains "the public comment names the actual report path" "$OUT_A" "$REPORT_PATH_A"
 
 # --- Test B: security already cleared against an older head, so the push
@@ -775,7 +872,7 @@ contains "dry run says where the finding would have gone" "$(cat "$STUB/err-cd")
 contains "dry run still delivers the finding locally" "$OUT_CD" \
   "$(security_report_path yoshi/alpha 1 d00d9999)"
 
-unset HANDOFF_URL HANDOFF_TOKEN
+HANDOFF_URL="" HANDOFF_TOKEN=""  # as pr-reviewer.sh defines them when unconfigured
 export STUB_HEAD_SHA=abc123
 export DRY_RUN=1
 
@@ -800,6 +897,55 @@ eq "the steady-state skip stays quiet by default" "" "$QUIET"
 LOUD=$(VERBOSE=1 review_pr yoshi/alpha 1 yoshi 2>&1 >/dev/null)
 contains "VERBOSE names the up-to-date PR" "$LOUD" 'yoshi/alpha#1'
 contains "VERBOSE explains the head was already reviewed" "$LOUD" 'already reviewed'
+
+# --- Test D: the head is already reviewed and no issue comment is new, but a
+# reply was left on the diff. That is the exact case that used to report "up to
+# date" forever, so it is driven end-to-end rather than trusted to the unit. ---
+cat >"$STUB/threads-one.json" <<'JSON'
+[
+ {"id":5,"user":{"login":"author"},"path":"auth/verify.go","line":88,
+  "updated_at":"2026-08-26T12:00:00Z",
+  "body":"INLINEREPLY this path is unreachable without the admin token"}
+]
+JSON
+export STUB_THREADS_FILE="$STUB/threads-one.json"
+: >"$STUB_CLAUDE_LOG"
+
+rc "an inline reply on an otherwise up-to-date PR is reviewed" 0 \
+  review_pr yoshi/alpha 1 yoshi
+OUT_D=$(review_pr yoshi/alpha 1 yoshi)
+CLAUDE_D=$(cat "$STUB_CLAUDE_LOG")
+contains "the inline reply reaches the model's prompt" "$CLAUDE_D" 'INLINEREPLY'
+contains "the prompt says where the inline reply was left" "$CLAUDE_D" \
+  'auth/verify.go:88'
+contains "the new state records the inline reply as seen" "$OUT_D" \
+  'seen=2026-08-26T12:00:00Z'
+
+# ...and once seen, it must not re-trigger on the next tick, or every inline
+# reply would buy a review forever.
+STATE_D=$(render_comment security "$CLAUDE_MODEL" abc123 '2026-08-26T12:00:00Z' open 'still open')
+jq -n --arg b "$STATE_D" \
+  '[{id:1, user:{login:"yoshi"}, url:"u1", updated_at:"2026-08-26T12:30:00Z", body:$b}]' \
+  >"$STUB/comments-saw-thread.json"
+export STUB_COMMENTS_FILE="$STUB/comments-saw-thread.json"
+: >"$STUB_CLAUDE_LOG"
+rc "an inline reply already seen does not re-trigger" 2 review_pr yoshi/alpha 1 yoshi
+eq "no model call for an inline reply already seen" "" "$(cat "$STUB_CLAUDE_LOG")"
+
+# A review submission alone (no inline comment) is the other new trigger.
+export STUB_THREADS_FILE=/dev/null
+cat >"$STUB/reviews-one.json" <<'JSON'
+[
+ {"user":{"login":"author"},"state":"CHANGES_REQUESTED",
+  "submitted_at":"2026-08-26T13:00:00Z","body":"REVIEWREPLY disagree, see the guard above"}
+]
+JSON
+export STUB_REVIEWS_FILE="$STUB/reviews-one.json"
+: >"$STUB_CLAUDE_LOG"
+rc "a review submission on an up-to-date PR is reviewed" 0 review_pr yoshi/alpha 1 yoshi
+contains "the review submission's text reaches the model's prompt" \
+  "$(cat "$STUB_CLAUDE_LOG")" 'REVIEWREPLY'
+export STUB_REVIEWS_FILE=/dev/null
 
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"

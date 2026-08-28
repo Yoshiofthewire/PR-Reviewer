@@ -2,6 +2,21 @@
 # Review open pull requests locally through the security persona reviewer.
 set -uo pipefail
 
+# macOS ships bash 3.2, which has no associative arrays, so review-core.sh's
+# PERSONA_* tables fail to parse under it. Whether `env bash` finds a modern
+# bash depends on PATH order, which differs between the launchd job and an
+# operator's interactive shell -- so locate one here and re-exec, rather than
+# dying with an unbound-variable error from inside a sourced file.
+if [[ ${BASH_VERSINFO[0]:-0} -lt 4 ]]; then
+  if [[ -z ${PR_REVIEWER_BASH_REEXEC:-} ]]; then
+    for _bash in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+      [[ -x $_bash ]] && exec env PR_REVIEWER_BASH_REEXEC=1 "$_bash" "$0" "$@"
+    done
+  fi
+  echo "ERROR: bash 4+ is required (running ${BASH_VERSION:-unknown}); install one, e.g. 'brew install bash'" >&2
+  exit 1
+fi
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib/review-core.sh
 source "$SCRIPT_DIR/lib/review-core.sh"
@@ -195,6 +210,46 @@ run_persona() { # run_persona <persona> <dir> <prompt-file>
   return $prc
 }
 
+# gh --paginate emits one JSON array per page rather than one array overall, so
+# every source is slurped and flattened before use: a pull request past the
+# first page of comments would otherwise hand jq several arrays and every
+# downstream filter would answer once per page instead of once overall.
+flatten_pages() { # flatten_pages <json>
+  jq -s '[.[] | .[]?]' <<<"${1:-}"
+}
+
+# A reply typed in the Files-changed tab, or submitted as a formal review, is
+# NOT an issue comment: those live at repos/:r/pulls/:n/comments and
+# repos/:r/pulls/:n/reviews, which the issue-comments endpoint never returns.
+# Left unmerged, answering a finding inline meant the persona never re-ran and
+# the finding could never reach RESOLVED or WITHDRAWN.
+#
+# Both are normalised onto the issue-comment shape -- {user, updated_at, body}
+# -- so newest_reply, reply_bodies and the identity rules they encode keep
+# operating on one uniform list. Two shape differences have to be absorbed
+# here: an inline comment's text is meaningless without the line it hangs off,
+# so its location is prefixed to the body; and a review carries submitted_at
+# rather than updated_at, plus (for a bare approval) no body at all, which is
+# dropped rather than counted as a reply that says nothing.
+merge_reply_sources() { # merge_reply_sources <issue-comments> <thread-comments> <reviews>
+  local issues threads reviews
+  issues=$(flatten_pages "$1") || return 1
+  threads=$(flatten_pages "${2:-}") || return 1
+  reviews=$(flatten_pages "${3:-}") || return 1
+  jq -n --argjson issues "$issues" --argjson threads "$threads" \
+        --argjson reviews "$reviews" '
+    $issues
+    + [ $threads[]
+        | {user, updated_at,
+           body: ("on `" + (.path // "?") + ":"
+                  + ((.line // .original_line // 0) | tostring) + "`: "
+                  + (.body // ""))} ]
+    + [ $reviews[]
+        | select((.body // "") != "")
+        | {user, updated_at: (.submitted_at // ""),
+           body: ("review " + (.state // "COMMENTED") + ": " + .body)} ]'
+}
+
 # Excludes a comment only when it is BOTH the runner's AND starts with the
 # state marker, i.e. it is the bot's own persona/summary comment. Excluding by
 # login alone would hide a solo repo owner's own replies (the owner IS the
@@ -337,7 +392,7 @@ deliver_full_finding() { # deliver_full_finding <repo> <number> <head> <verdict>
 
 review_pr() { # review_pr <repo> <number> <runner-login>
   local repo="$1" number="$2" runner="$3"
-  local head_sha comments newest dir persona pc body_text state_head state_seen
+  local head_sha comments threads reviews replies newest dir persona pc body_text state_head state_seen
   local prior url out verdict body stripped report_ref cleared=0 lines="" truncated="" rc=0 repo_json
   local t0
   local -A VERDICTS=()
@@ -347,7 +402,26 @@ review_pr() { # review_pr <repo> <number> <runner-login>
   repo_json=$(gh repo view "$repo" --json isPrivate) || return 1
   IS_PUBLIC=$(visibility_flag "$repo_json")
   comments=$(gh api --paginate "repos/$repo/issues/$number/comments") || return 1
-  newest=$(newest_reply "$comments" "$runner")
+  # Flattened here too, so persona_comment sees one array on a pull request
+  # whose comments run past the first page; several arrays would make its
+  # `first(...)` answer once per page and the bot would post a second comment
+  # instead of patching its own.
+  comments=$(flatten_pages "$comments") || return 1
+  # The two review-thread endpoints are fetched separately and merged into the
+  # reply stream. A failure on either is a warning, not a fatal: losing a
+  # trigger is better than losing the whole review, and the repo may simply not
+  # expose them. The bot's own comments are issue comments, so persona_comment
+  # keeps reading $comments alone -- only replies come from the merged list.
+  threads=$(gh api --paginate "repos/$repo/pulls/$number/comments") || {
+    echo "WARNING $repo#$number: review-thread comments could not be read; treating as none" >&2
+    threads=''
+  }
+  reviews=$(gh api --paginate "repos/$repo/pulls/$number/reviews") || {
+    echo "WARNING $repo#$number: review submissions could not be read; treating as none" >&2
+    reviews=''
+  }
+  replies=$(merge_reply_sources "$comments" "$threads" "$reviews") || return 1
+  newest=$(newest_reply "$replies" "$runner")
 
   # Seed every persona's verdict from what is already posted, so the summary is
   # correct even for personas that do not need re-reviewing this tick.
@@ -384,7 +458,7 @@ review_pr() { # review_pr <repo> <number> <runner-login>
     url=$(jq -r '.url // empty' <<<"${pc:-null}")
     {
       build_persona_task "$persona" "$prior" \
-        "$(reply_bodies "$comments" "$(state_field "$prior" seen)" "$runner")"
+        "$(reply_bodies "$replies" "$(state_field "$prior" seen)" "$runner")"
       printf '\nDiff (possibly truncated):\n'
       cat "$WORK_DIR/diff.$$"
     } >"$WORK_DIR/prompt.$$"
@@ -482,13 +556,23 @@ main() {
 
 if [[ ${BASH_SOURCE[0]:-} == "$0" ]]; then
   # Serialise every invocation regardless of how it was started (directly or
-  # via the systemd unit), so a concurrent tick cannot reap another tick's
-  # checkout mid-review. Re-exec under flock; a second concurrent run fails
-  # to acquire the lock and exits quietly rather than erroring loudly.
+  # via the timer), so a concurrent tick cannot reap another tick's checkout
+  # mid-review. Re-exec through flock under "$BASH" rather than the shebang:
+  # the shebang would resolve `env bash` afresh and can land on macOS's 3.2
+  # even though the guard above already found a modern one.
+  #
+  # -E 75 separates "another tick holds the lock" from a review failure, so a
+  # skipped tick reports itself instead of exiting 1 with no output at all.
   if [[ -z ${PR_REVIEWER_LOCKED:-} ]]; then
     LOCK_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/pr-reviewer.lock"
     mkdir -p "$(dirname "$LOCK_FILE")" || exit 1
-    exec env PR_REVIEWER_LOCKED=1 flock -n "$LOCK_FILE" "$0" "$@"
+    env PR_REVIEWER_LOCKED=1 flock -n -E 75 "$LOCK_FILE" "$BASH" "$0" "$@"
+    rc=$?
+    if [[ $rc -eq 75 ]]; then
+      echo "pr-reviewer · another tick is already running; skipping this one" >&2
+      exit 0
+    fi
+    exit $rc
   fi
   main "$@"
 fi

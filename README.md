@@ -12,19 +12,27 @@ The `simplicity` (`ponytail-review`) and `hostile` (`hostile-review`) personas
 were removed: they never cleared, so the gate was never passable.
 
 The persona re-reviews when the head SHA changes or when anyone replies after
-its last comment. It marks each prior finding RESOLVED, UNRESOLVED, or
-WITHDRAWN, so a correct rebuttal can clear a finding without a commit. When
-nothing actionable remains it reports CLEARED. A second comment tracks the
-tally.
+its last comment. A reply is any of the three places GitHub keeps them — an
+issue comment, an inline comment on the diff, or a submitted review — because
+answering a finding in the Files-changed tab has to count as answering it. An
+inline reply reaches the persona with the `path:line` it hangs off; a review
+reaches it with its state; a bodiless approval is not a reply. Still not
+triggers: editing the pull request description or title, and anything at all on
+a closed pull request.
+
+It marks each prior finding RESOLVED, UNRESOLVED, or WITHDRAWN, so a correct
+rebuttal can clear a finding without a commit. When nothing actionable remains
+it reports CLEARED. A second comment tracks the tally.
 
 This never approves a pull request. It posts comments only, so no bot can
 satisfy branch protection and merging stays your decision.
 
 ## Setup
 
-Requires `gh`, `jq`, `git`, and the `claude` CLI, plus `curl` if you post
-findings to a hand-off board. `gh` must be logged in with
-`repo` and `read:org`:
+Requires bash 4+, `gh`, `jq`, `git`, and the `claude` CLI, plus `curl` if you
+post findings to a hand-off board. macOS ships bash 3.2, which cannot run this;
+`brew install bash` is enough, and the script re-execs itself under it wherever
+your PATH happens to put it. `gh` must be logged in with `repo` and `read:org`:
 
 ```sh
 gh auth login
@@ -52,8 +60,8 @@ logs with `journalctl --user -u pr-reviewer.service`.
 | `REASONING_EFFORT` | `high` | Effort for every persona |
 | `WORK_DIR` | `$XDG_RUNTIME_DIR/pr-reviewer`, or `/tmp/pr-reviewer` | Throwaway checkout directory; basename must be `pr-reviewer` because the reaper refuses to delete from directories it cannot confirm are its own |
 
-An unchanged pull request costs nothing beyond two API calls; only a changed one
-spends tokens.
+An unchanged pull request costs nothing beyond four API calls; only a changed
+one spends tokens.
 
 ## How PR code is contained
 
