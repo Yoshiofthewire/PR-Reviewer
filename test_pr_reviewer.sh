@@ -43,7 +43,9 @@ lines_of() { # lines_of <text>
 
 # BSD stat and GNU stat spell the octal-mode format differently; try both.
 file_mode() { # file_mode <path>
-  stat -f '%OLp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null
+  # GNU first: on Linux `stat -f` means "filesystem status" and exits 0, so
+  # trying the BSD form first silently wins and returns filesystem info.
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%OLp' "$1" 2>/dev/null
 }
 
 contains() { # contains <desc> <haystack> <needle>
