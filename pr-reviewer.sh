@@ -186,13 +186,14 @@ strip_verdict() { # strip_verdict <model-output>
 # --setting-sources user stops a CLAUDE.md in the checkout issuing instructions.
 # --safe-mode would remove the skills and must never be added.
 run_persona() { # run_persona <persona> <dir> <prompt-file>
-  local persona="$1" dir="$2" prompt="$3" abs_prompt errlog prc
+  local persona="$1" dir="$2" prompt="$3" abs_prompt errlog outlog prc pid throbber_pid=""
   # Prompt path must be absolute; resolve it before cd-ing into the untrusted checkout.
   abs_prompt=$(cd "$(dirname "$prompt")" && pwd)/$(basename "$prompt") || return 1
   # The CLI writes startup chatter to stderr (settings warnings and the like) on
   # every single invocation. Captured here and surfaced only on failure, so a
   # five-minute timer does not pump the same warnings into the journal forever.
   errlog=$(mktemp) || return 1
+  outlog=$(mktemp) || { rm -f "$errlog"; return 1; }
   (
     cd "$dir" || exit 1
     claude -p --no-session-persistence --strict-mcp-config --setting-sources user \
@@ -200,13 +201,33 @@ run_persona() { # run_persona <persona> <dir> <prompt-file>
       --model "$CLAUDE_MODEL" --effort "$REASONING_EFFORT" \
       --system-prompt "$(persona_system_prompt "$persona" "${IS_PUBLIC:-1}")" \
       <"$abs_prompt"
-  ) 2>"$errlog"
+  ) >"$outlog" 2>"$errlog" &
+  pid=$!
+  if [[ -t 2 ]]; then
+    (
+      local -a frames=('|' '/' '-' '\\')
+      local i=0
+      while :; do
+        printf '\r  %-7s %s %s' '' "${frames[i++ % ${#frames[@]}]}" \
+          'waiting for persona…' >&2
+        sleep 0.2
+      done
+    ) &
+    throbber_pid=$!
+  fi
+  wait "$pid"
   prc=$?
+  if [[ -n $throbber_pid ]]; then
+    kill "$throbber_pid" 2>/dev/null
+    wait "$throbber_pid" 2>/dev/null || :
+    printf '\r\033[2K' >&2
+  fi
+  cat "$outlog"
   if [[ $prc -ne 0 ]]; then
     echo "--- $persona: last 20 stderr lines ---" >&2
     tail -20 "$errlog" >&2
   fi
-  rm -f "$errlog"
+  rm -f "$errlog" "$outlog"
   return $prc
 }
 
