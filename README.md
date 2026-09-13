@@ -51,7 +51,7 @@ logs with `journalctl --user -u pr-reviewer.service`.
 | --- | --- | --- |
 | `REPOSITORIES` | empty | Comma-separated allowlist; empty means all |
 | `EXCLUDE_REPOSITORIES` | empty | Comma-separated denylist; wins over the allowlist |
-| `MAX_PRS_PER_TICK` | 5 | Pull requests reviewed per tick; the rest are logged and deferred |
+| `MAX_PRS_PER_TICK` | 5 | Pull requests reviewed per tick; already-reviewed ones do not count, the rest are logged and deferred |
 | `MAX_DIFF_BYTES` | 180000 | Diff truncation threshold in bytes; truncation is stated in the comment |
 | `DRY_RUN` | unset | Print comment bodies instead of posting them |
 | `HANDOFF_URL` | empty | Hand-off board base URL; unset means deliver full findings to a local file instead |

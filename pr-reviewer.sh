@@ -55,7 +55,7 @@ discover_prs() {
     echo "WARNING: discovery hit the 100-PR query limit; some open PRs may not have been seen this tick" >&2
 
   # Drafts and bots are filtered here rather than in jq so each one can be named.
-  local draft author authortype total=0 deferred=0 skipped=0
+  local draft author authortype total=0 skipped=0
   while IFS=$'\t' read -r repo number updated title draft author authortype; do
     [[ -n $repo ]] || continue
     total=$((total + 1))
@@ -76,13 +76,8 @@ discover_prs() {
       skipped=$((skipped + 1))
       continue
     fi
-    if [[ $kept -ge $MAX_PRS_PER_TICK ]]; then
-      log_pr defer "$repo#$number" "per-tick cap of $MAX_PRS_PER_TICK reached"
-      deferred=$((deferred + 1))
-      continue
-    fi
     kept=$((kept + 1))
-    log_pr review "$repo#$number" "$title"
+    log_pr check "$repo#$number" "$title"
     printf '%s\t%s\t%s\t%s\n' "$repo" "$number" "$updated" "$title"
   done < <(
     jq -r 'sort_by(.updatedAt) | reverse
@@ -90,8 +85,7 @@ discover_prs() {
                     (.author.login // "unknown"), (.author.type // "User")]
            | @tsv' <<<"$raw"
   )
-  printf '\n  %s open · %s to review · %s deferred · %s skipped\n\n' \
-    "$total" "$kept" "$deferred" "$skipped" >&2
+  printf '\n  %s open · %s to check · %s skipped\n\n' "$total" "$kept" "$skipped" >&2
 }
 
 WORK_DIR="${WORK_DIR:-${XDG_RUNTIME_DIR:-/tmp}/pr-reviewer}"
@@ -529,29 +523,40 @@ main() {
   # Capture discovery output before iterating: a `while ... < <(discover_prs)`
   # process substitution cannot see discover_prs's exit status, so a discovery
   # failure would silently loop zero times and exit 0 instead of failing loudly.
-  local prs repo number failures=0 reviewed=0 current=0 prc
+  local prs
   echo "pr-reviewer · scanning" >&2
   prs=$(discover_prs) || { echo "ERROR: discovery failed" >&2; exit 1; }
-  if [[ -n $prs ]]; then
-    while IFS=$'\t' read -r repo number _ _; do
-      [[ -n $repo ]] || continue
-      # One bad PR must not stop the rest of the tick.
-      review_pr "$repo" "$number" "$runner"
-      prc=$?
-      case $prc in
-        0) reviewed=$((reviewed + 1)) ;;
-        2) current=$((current + 1)) ;;
-        *) failures=$((failures + 1)); log_pr FAILED "$repo#$number" 'see errors above' ;;
-      esac
-    done <<<"$prs"
-  fi
+  review_queue "$runner" "$prs" || exit 1
+}
+
+# The cap lives here, not in discovery: only a review that actually runs
+# consumes a slot, so PRs already up to date fall through to the next candidate
+# instead of deferring it for a tick that then does nothing.
+review_queue() { # review_queue <runner-login> <tsv-of-prs>
+  local runner="$1" prs="$2" repo number failures=0 reviewed=0 current=0 deferred=0 prc
+  [[ -n $prs ]] && while IFS=$'\t' read -r repo number _ _; do
+    [[ -n $repo ]] || continue
+    if [[ $reviewed -ge $MAX_PRS_PER_TICK ]]; then
+      log_pr defer "$repo#$number" "per-tick cap of $MAX_PRS_PER_TICK reached"
+      deferred=$((deferred + 1))
+      continue
+    fi
+    # One bad PR must not stop the rest of the tick.
+    review_pr "$repo" "$number" "$runner"
+    prc=$?
+    case $prc in
+      0) reviewed=$((reviewed + 1)) ;;
+      2) current=$((current + 1)) ;;
+      *) failures=$((failures + 1)); log_pr FAILED "$repo#$number" 'see errors above' ;;
+    esac
+  done <<<"$prs"
 
   local hint=""
   [[ $current -gt 0 && -z ${VERBOSE:-} ]] && hint=" (VERBOSE=1 to list)"
-  printf '\npr-reviewer · %s reviewed · %s up to date%s · %s failed\n' \
-    "$reviewed" "$current" "$hint" "$failures" >&2
+  printf '\npr-reviewer · %s reviewed · %s up to date%s · %s deferred · %s failed\n' \
+    "$reviewed" "$current" "$hint" "$deferred" "$failures" >&2
 
-  [[ $failures -eq 0 ]] || exit 1
+  [[ $failures -eq 0 ]]
 }
 
 if [[ ${BASH_SOURCE[0]:-} == "$0" ]]; then

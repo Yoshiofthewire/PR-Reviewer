@@ -253,11 +253,21 @@ eq "three PRs survive the filter" 3 "$(lines_of "$OUT")"
 eq "newest updatedAt sorts first" 'yoshi/beta' "$(head -1 <<<"$OUT" | cut -f1)"
 eq "oldest updatedAt sorts last" 'yoshi/alpha' "$(tail -1 <<<"$OUT" | cut -f1)"
 
-# shellcheck disable=SC2034  # REPOSITORIES, EXCLUDE_REPOSITORIES, MAX_PRS_PER_TICK used by discover_prs
-REPOSITORIES="" EXCLUDE_REPOSITORIES="" MAX_PRS_PER_TICK=2
-CAPPED=$(discover_prs 2>"$STUB/err")
-eq "cap limits the batch" 2 "$(lines_of "$CAPPED")"
-contains "capped PRs are named on stderr" "$(cat "$STUB/err")" 'yoshi/alpha#1'
+# --- the per-tick cap counts reviews that ran, not PRs that were looked at ---
+# Stub review_pr: PRs listed in STUB_CURRENT are up to date (rc 2), the rest review (rc 0).
+review_pr() { case " ${STUB_CURRENT:-} " in *" $1#$2 "*) return 2 ;; esac; return 0; }
+QUEUE=$'yoshi/beta\t2\tt\tBeta\nyoshi/alpha\t1\tt\tAlpha\norgone/gamma\t3\tt\tGamma'
+MAX_PRS_PER_TICK=2
+CAPLOG=$(STUB_CURRENT='' review_queue yoshi "$QUEUE" 2>&1)
+contains "cap defers the PR past the limit" "$CAPLOG" 'defer   orgone/gamma#3'
+contains "a deferred PR says the cap is why" "$CAPLOG" 'per-tick cap of 2 reached'
+contains "tick tally counts the deferral" "$CAPLOG" '2 reviewed · 0 up to date · 1 deferred'
+FALLLOG=$(STUB_CURRENT='yoshi/beta#2' review_queue yoshi "$QUEUE" 2>&1)
+lacks "an up-to-date PR does not consume a cap slot" "$FALLLOG" 'defer   '
+contains "the next candidate is reviewed instead" "$FALLLOG" '2 reviewed · 1 up to date (VERBOSE=1 to list) · 0 deferred'
+rc "an empty queue is a clean tick" 0 review_queue yoshi ""
+unset -f review_pr
+source ./pr-reviewer.sh
 
 STUB_ORGS_FAIL=1 rc "discover_prs fails when org lookup fails" 1 discover_prs
 
@@ -275,12 +285,7 @@ contains "a draft PR is named when skipped" "$DROPPED" 'yoshi/wip#5'
 contains "a draft PR says it was skipped for being a draft" "$DROPPED" 'draft'
 contains "a filtered repo is named when skipped" "$DROPPED" 'yoshi/skipme#4'
 contains "a filtered repo says which list excluded it" "$DROPPED" 'EXCLUDE_REPOSITORIES'
-contains "discovery reports a tally" "$DROPPED" 'to review'
-
-# shellcheck disable=SC2034  # MAX_PRS_PER_TICK is read by discover_prs
-MAX_PRS_PER_TICK=1
-CAPMSG=$(discover_prs 2>&1 >/dev/null)
-contains "a deferred PR says the cap is why" "$CAPMSG" 'per-tick cap of 1 reached'
+contains "discovery reports a tally" "$DROPPED" 'to check'
 
 # --- bot-authored PRs (dependabot et al) are skipped by default ---
 REPOSITORIES="" EXCLUDE_REPOSITORIES="" MAX_PRS_PER_TICK=10 REVIEW_BOT_PRS=""
