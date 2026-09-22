@@ -56,7 +56,7 @@ logs with `journalctl --user -u pr-reviewer.service`.
 | `DRY_RUN` | unset | Print comment bodies instead of posting them |
 | `HANDOFF_URL` | empty | Hand-off board base URL; unset means deliver full findings to a local file instead |
 | `HANDOFF_TOKEN` | empty | Bearer token for that board; both must be set for board delivery |
-| `CLAUDE_MODEL` | `opus` | Model for every persona |
+| `CLAUDE_MODEL` | `claude-opus-5-5` | Model for every persona |
 | `REASONING_EFFORT` | `high` | Effort for every persona |
 | `WORK_DIR` | `$XDG_RUNTIME_DIR/pr-reviewer`, or `/tmp/pr-reviewer` | Throwaway checkout directory; basename must be `pr-reviewer` because the reaper refuses to delete from directories it cannot confirm are its own |
 

@@ -23,7 +23,7 @@ source "$SCRIPT_DIR/lib/review-core.sh"
 
 MAX_PRS_PER_TICK="${MAX_PRS_PER_TICK:-5}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-180000}"
-CLAUDE_MODEL="${CLAUDE_MODEL:-opus}"
+CLAUDE_MODEL="${CLAUDE_MODEL:-claude-opus-5-5}"
 REASONING_EFFORT="${REASONING_EFFORT:-high}"
 
 resolve_owners() {
