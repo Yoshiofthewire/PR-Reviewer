@@ -425,6 +425,30 @@ eq "missing verdict defaults to open" open "$(parse_verdict 'rambling with no ve
 eq "changes verdict is parsed as open" open "$(parse_verdict 'VERDICT: CHANGES_REQUIRED
 ### [P0] Thing')"
 
+# The model signs after its verdict; the signature lines do not hide it
+SIGNED='All prior findings resolved.
+VERDICT: CLEARED
+
+---
+*claude-opus-5-5 using security-audit on behalf of Yoshi*'
+eq "signed VERDICT: CLEARED parses as cleared" cleared "$(parse_verdict "$SIGNED")"
+eq "strip_verdict removes the verdict above a signature" 'All prior findings resolved.
+
+---
+*claude-opus-5-5 using security-audit on behalf of Yoshi*' "$(strip_verdict "$SIGNED")"
+
+# A CHANGES_REQUIRED after a CLEARED still wins even when signed
+SIGNED_OPEN='VERDICT: CLEARED
+VERDICT: CHANGES_REQUIRED
+### [P0] Thing
+---
+*claude-opus-5-5 using security-audit on behalf of Yoshi*'
+eq "signed changes verdict stays open" open "$(parse_verdict "$SIGNED_OPEN")"
+
+# A signature alone is not a verdict
+eq "signature without verdict defaults to open" open "$(parse_verdict '---
+*claude-opus-5-5 using security-audit on behalf of Yoshi*')"
+
 # strip_verdict preserves mid-body quoted verdict, removes final one
 eq "strip_verdict preserves quoted mid-body verdict" 'Check the log: "VERDICT: CLEARED"' \
   "$(strip_verdict 'Check the log: "VERDICT: CLEARED"

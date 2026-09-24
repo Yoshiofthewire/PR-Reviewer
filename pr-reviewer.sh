@@ -151,9 +151,21 @@ build_persona_task() { # build_persona_task <persona> <prior-findings> <replies>
   printf '### [P0|P1|P2] Short imperative title\n- Location: `path:line`\n- Problem: specific failure and triggering conditions\n- Fix: explicit implementation direction\n- Verify: one concrete test or command\n'
 }
 
+# The model signs after its verdict ("---" then "*model using skill on behalf
+# of Yoshi*"), so the verdict is the last non-blank line once those trailing
+# signature lines are ignored. Nothing else after the verdict counts: a
+# CHANGES_REQUIRED below a CLEARED still wins.
+SIGNATURE_LINE='^[[:space:]]*(-{3,}|\*[^*]+\*)[[:space:]]*$'
+
+verdict_line_number() { # verdict_line_number <model-output>; prints the line number or nothing
+  grep -nv '^[[:space:]]*$' <<<"$1" | grep -Ev "^[0-9]+:${SIGNATURE_LINE#^}" | tail -n1 | cut -d: -f1
+}
+
 parse_verdict() { # parse_verdict <model-output>
-  local last
-  last=$(grep -v '^[[:space:]]*$' <<<"$1" | tail -n1)
+  local n last
+  n=$(verdict_line_number "$1")
+  [[ -n $n ]] || { printf 'open'; return 0; }
+  last=$(sed -n "${n}p" <<<"$1")
   last="${last#"${last%%[![:space:]]*}"}"
   last="${last%"${last##*[![:space:]]}"}"
   [[ $last == "VERDICT: CLEARED" ]] && { printf 'cleared'; return 0; }
@@ -161,18 +173,13 @@ parse_verdict() { # parse_verdict <model-output>
 }
 
 strip_verdict() { # strip_verdict <model-output>
-  local last_line last_line_num
-  # Find the last non-blank line
-  last_line=$(grep -v '^[[:space:]]*$' <<<"$1" | tail -n1)
-  # If it's not a verdict line, return as-is with trailing blanks trimmed
-  if [[ ! $last_line =~ ^[[:space:]]*VERDICT: ]]; then
+  local n
+  n=$(verdict_line_number "$1")
+  if [[ -z $n ]] || [[ ! $(sed -n "${n}p" <<<"$1") =~ ^[[:space:]]*VERDICT: ]]; then
     sed -e '/./,$!d' <<<"$1"
     return 0
   fi
-  # It is a verdict line; find its line number in the original output
-  last_line_num=$(grep -nv '^[[:space:]]*$' <<<"$1" | tail -n1 | cut -d: -f1)
-  # Delete that specific line and trim trailing blanks
-  sed -e "${last_line_num}d" <<<"$1" | sed -e '/./,$!d'
+  sed -e "${n}d" <<<"$1" | sed -e '/./,$!d'
 }
 
 # Flags are load-bearing: --strict-mcp-config removes the MCP surface (Gmail,
