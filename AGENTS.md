@@ -46,6 +46,10 @@
 - The board is a delivery channel, not the record: everything there expires
   seven days after a folder's last post. Nothing may depend on reading it back,
   and review state stays in the GitHub comment.
+- A re-review of a withheld finding therefore knows only its severity and file.
+  The persona re-audits that file at the current head and answers RESOLVED when
+  no defect of that severity remains there; "detail unavailable" is never a
+  reason for UNRESOLVED.
 - `DRY_RUN` must make no outward-facing write, so it never posts to the board.
 - Never review archived repositories or draft pull requests.
 - `WORK_DIR` basename must be exactly `pr-reviewer`; the reaper refuses to delete
