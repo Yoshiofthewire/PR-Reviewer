@@ -11,8 +11,8 @@
 - `lib/review-core.sh` owns pure logic: filtering, state codec, re-review
   decision, rendering, redaction. No network, no writes.
 - `pr-reviewer.sh` owns GitHub I/O, checkout lifecycle, and persona dispatch.
-- `test_pr_reviewer.sh` owns dependency-free checks. It stubs `gh`, `git`, and
-  `claude` on `PATH`; it never reaches the network.
+- `test_pr_reviewer.sh` owns dependency-free checks. It stubs `gh`, `git`,
+  `codex`, and `claude` on `PATH`; it never reaches the network.
 - `verify_isolation.sh` owns proof that the sandboxing still holds. It costs
   tokens and is never run by the tick or the test suite.
 - `systemd/` and `install.sh` own scheduling.
@@ -20,7 +20,14 @@
 
 ## Local Contracts
 
-- The persona invocation is load-bearing and must stay exactly
+- Codex is the primary runner; Claude is the fallback on failure or empty output.
+  Sign results with the model that actually succeeded. Codex must run outside
+  the checkout with user config/rules, project instructions, discovered skills,
+  hooks, plugins, apps, browsing, and delegation disabled. Supply only the trusted
+  security skill explicitly. Keep the read-only OS sandbox, approval `never`,
+  and an empty inherited command environment. Verify both runners with
+  `./verify_isolation.sh` after invocation changes.
+- The Claude fallback invocation is load-bearing and must stay exactly
   `--no-session-persistence --strict-mcp-config --setting-sources user --tools "Skill,Read,Grep,Glob"`.
   Dropping `--strict-mcp-config` restores Gmail, Firebase, and Playwright code
   execution, which `--tools` does not filter. Dropping `--setting-sources user`
@@ -58,7 +65,7 @@
 
 ## Work Guidance
 
-- Reach for `gh`, `jq`, `git`, `claude`, and `curl` (board posting only). Add no
+- Reach for `gh`, `jq`, `git`, `codex`, `claude`, and `curl` (board posting only). Add no
   other dependencies.
 - Run without `set -e`; propagate errors with explicit `|| return 1`.
 - Isolate failures per pull request. One bad pull request must not end the tick.

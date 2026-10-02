@@ -242,6 +242,11 @@ PATH="$STUB/bin:$PATH"
 
 # shellcheck source=pr-reviewer.sh
 source ./pr-reviewer.sh
+eq "Codex is the default backend" codex "$REVIEW_BACKEND"
+eq "6.1 Sol is the default model" gpt-6.1-sol "$CODEX_MODEL"
+# Existing cases exercise the retained Claude path; Codex/fallback cases below
+# provide their own stub. Never let the dependency-free suite run a real CLI.
+REVIEW_BACKEND=claude
 
 eq "resolve_owners lists the user and every org" \
   'yoshi orgone orgtwo' "$(resolve_owners | tr '\n' ' ' | sed 's/ $//')"
@@ -506,6 +511,56 @@ contains "invocation pins user setting sources" "$ARGS" '--setting-sources'
 contains "invocation restricts tools" "$ARGS" 'Skill,Read,Grep,Glob'
 lacks "invocation must not use safe-mode, which strips skills" "$ARGS" '--safe-mode'
 lacks "invocation must not grant Bash" "$ARGS" 'Bash'
+
+# --- Codex output selection, isolation flags, and fallback attribution ---
+cat >"$STUB/bin/codex" <<'STUBEOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$STUB_ARGS"
+cat >"$STUB_ARGS.stdin"
+[[ ${STUB_CODEX_FAIL:-0} == 1 ]] && { echo 'partial untrusted output'; exit 1; }
+while [[ $# -gt 0 ]]; do
+  if [[ $1 == --output-last-message ]]; then
+    [[ ${STUB_CODEX_EMPTY:-0} == 1 ]] || printf 'Astra review\nVERDICT: CLEARED\n' >"$2"
+    break
+  fi
+  shift
+done
+echo 'CLI chatter must never be posted'
+STUBEOF
+chmod +x "$STUB/bin/codex"
+SECURITY_SKILL_FILE="$STUB/security-skill.md"
+echo 'Trusted security-audit instructions' >"$SECURITY_SKILL_FILE"
+REVIEW_BACKEND=codex
+run_persona security "$QDIR" "$STUB/prompt" >"$STUB/result"
+eq "Codex success identifies Astra" "$CODEX_MODEL" "$REVIEW_MODEL"
+contains "Codex returns final message" "$(cat "$STUB/result")" 'Astra review'
+lacks "Codex stdout chatter is discarded" "$(cat "$STUB/result")" 'CLI chatter'
+ARGS=$(cat "$STUB_ARGS")
+contains "Codex uses readonly sandbox" "$ARGS" $'--sandbox\nread-only'
+contains "Codex ignores user config" "$ARGS" '--ignore-user-config'
+contains "Codex ignores exec rules" "$ARGS" '--ignore-rules'
+contains "Codex disables loaded instructions" "$ARGS" 'project_doc_max_bytes=0'
+contains "Codex disables web access" "$ARGS" 'web_search="disabled"'
+contains "Codex disables agent tools" "$ARGS" 'agents.enabled=false'
+contains "Codex gets the trusted skill" "$ARGS" 'Trusted security-audit instructions'
+contains "Codex receives the review prompt" "$(cat "$STUB_ARGS.stdin")" 'task text'
+for feature in apps plugins hooks multi_agent browser_use computer_use; do
+  contains "Codex disables $feature" "$ARGS" "$(printf '%s\n%s' --disable "$feature")"
+done
+STUB_CODEX_FAIL=1 run_persona security "$QDIR" "$STUB/prompt" >"$STUB/result" 2>/dev/null
+eq "fallback signs as Claude" "$CLAUDE_MODEL" "$REVIEW_MODEL"
+lacks "failed Codex output is discarded" "$(cat "$STUB/result")" 'partial untrusted'
+contains "fallback returns Claude result" "$(cat "$STUB/result")" 'nothing to report'
+STUB_CODEX_EMPTY=1 run_persona security "$QDIR" "$STUB/prompt" >"$STUB/result" 2>/dev/null
+eq "empty Codex result also falls back" "$CLAUDE_MODEL" "$REVIEW_MODEL"
+mv "$STUB/bin/codex" "$STUB/bin/codex.saved"
+# Stub command lookup without risking a real codex elsewhere on PATH.
+printf '#!/usr/bin/env bash\nexit 127\n' >"$STUB/bin/codex"
+chmod +x "$STUB/bin/codex"
+run_persona security "$QDIR" "$STUB/prompt" >"$STUB/result" 2>/dev/null
+eq "unavailable Codex falls back" "$CLAUDE_MODEL" "$REVIEW_MODEL"
+mv "$STUB/bin/codex.saved" "$STUB/bin/codex"
+REVIEW_BACKEND=claude
 
 # run_persona must handle relative prompt paths (resolves to absolute before cd)
 echo 'task from relative' >"$STUB/rel-prompt"
@@ -987,6 +1042,27 @@ rc "a review submission on an up-to-date PR is reviewed" 0 review_pr yoshi/alpha
 contains "the review submission's text reaches the model's prompt" \
   "$(cat "$STUB_CLAUDE_LOG")" 'REVIEWREPLY'
 export STUB_REVIEWS_FILE=/dev/null
+
+# Exercise attribution through review_pr, where a command substitution used to
+# hide which backend succeeded. Neither fallback nor summary may claim Astra.
+export STUB_COMMENTS_FILE="$STUB/comments-empty.json"
+REVIEW_BACKEND=codex
+: >"$STUB_CLAUDE_LOG"
+CODEX_REVIEW=$(review_pr yoshi/alpha 1 yoshi)
+contains "Codex persona and summary sign as Astra" "$CODEX_REVIEW" "$(signature "$CODEX_MODEL" security-audit)"
+eq "Codex success does not invoke fallback" '' "$(cat "$STUB_CLAUDE_LOG")"
+FALLBACK_REVIEW=$(STUB_CODEX_FAIL=1 review_pr yoshi/alpha 1 yoshi 2>/dev/null)
+contains "fallback review signs as Claude" "$FALLBACK_REVIEW" "$(signature "$CLAUDE_MODEL" security-audit)"
+lacks "fallback review never signs as Astra" "$FALLBACK_REVIEW" "$(signature "$CODEX_MODEL" security-audit)"
+cat >"$STUB/bin/claude" <<'STUBEOF'
+#!/usr/bin/env bash
+echo 'failed Claude partial output'
+exit 1
+STUBEOF
+STUB_CODEX_FAIL=1 review_pr yoshi/alpha 1 yoshi >"$STUB/both-failed" 2>/dev/null
+eq "both backend failures propagate" 1 "$?"
+lacks "both failures leave persona comment untouched" "$(cat "$STUB/both-failed")" '<!-- pr-reviewer persona=security '
+lacks "failed model output is not published" "$(cat "$STUB/both-failed")" 'partial output'
 
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"

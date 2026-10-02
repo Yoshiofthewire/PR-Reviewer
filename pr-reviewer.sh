@@ -23,8 +23,13 @@ source "$SCRIPT_DIR/lib/review-core.sh"
 
 MAX_PRS_PER_TICK="${MAX_PRS_PER_TICK:-5}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-180000}"
+REVIEW_BACKEND="${REVIEW_BACKEND:-codex}"
+CODEX_MODEL="${CODEX_MODEL:-gpt-6.1-sol}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-claude-opus-5-5}"
 REASONING_EFFORT="${REASONING_EFFORT:-high}"
+SECURITY_SKILL_FILE="${SECURITY_SKILL_FILE:-${CODEX_HOME:-$HOME/.codex}/skills/security-audit/SKILL.md}"
+REVIEW_MODEL="$CODEX_MODEL"
+[[ $REVIEW_BACKEND == claude ]] && REVIEW_MODEL="$CLAUDE_MODEL"
 
 resolve_owners() {
   gh api user --jq .login || return 1
@@ -92,7 +97,7 @@ WORK_DIR="${WORK_DIR:-${XDG_RUNTIME_DIR:-/tmp}/pr-reviewer}"
 
 # Files the CLI would auto-load as instructions. Renamed, not deleted: their real
 # content still needs reviewing, and it stays visible both here and in the diff.
-QUARANTINE_PATHS=(CLAUDE.md AGENTS.md .claude)
+QUARANTINE_PATHS=(CLAUDE.md AGENTS.md .claude .codex .agents)
 
 quarantine_instructions() { # quarantine_instructions <dir>
   local dir="$1" name
@@ -189,7 +194,7 @@ strip_verdict() { # strip_verdict <model-output>
 # Firebase, Playwright code execution) that --tools does NOT restrict, and
 # --setting-sources user stops a CLAUDE.md in the checkout issuing instructions.
 # --safe-mode would remove the skills and must never be added.
-run_persona() { # run_persona <persona> <dir> <prompt-file>
+run_claude() { # run_claude <persona> <dir> <prompt-file>
   local persona="$1" dir="$2" prompt="$3" abs_prompt errlog prc
   # Prompt path must be absolute; resolve it before cd-ing into the untrusted checkout.
   abs_prompt=$(cd "$(dirname "$prompt")" && pwd)/$(basename "$prompt") || return 1
@@ -212,6 +217,68 @@ run_persona() { # run_persona <persona> <dir> <prompt-file>
   fi
   rm -f "$errlog"
   return $prc
+}
+
+# Start outside the untrusted checkout so its .codex/config.toml cannot load.
+# Commands may read context, but the OS sandbox blocks writes and networking.
+# Keep this invocation shared with verify_isolation.sh.
+run_codex() { # run_codex <persona> <dir> <prompt-file>
+  local persona="$1" dir="$2" prompt="$3" runtime instructions prc
+  dir=$(cd "$dir" && pwd) || return 1
+  prompt=$(cd "$(dirname "$prompt")" && pwd)/$(basename "$prompt") || return 1
+  [[ -r $SECURITY_SKILL_FILE ]] || {
+    echo "ERROR: missing trusted security skill: $SECURITY_SKILL_FILE" >&2
+    return 1
+  }
+  instructions=$(printf '%s\n\nApply the following trusted skill. Its companion files are in %s. Do not execute checkout code. Return the review in your final message, without writing reports.\n\n%s' \
+    "$(persona_system_prompt "$persona" "${IS_PUBLIC:-1}")" \
+    "$(cd "$(dirname "$SECURITY_SKILL_FILE")" && pwd)" "$(cat "$SECURITY_SKILL_FILE")") || return 1
+  runtime=$(mktemp -d) || return 1
+  codex --no-daemon -a never exec --ignore-user-config --ignore-rules \
+    --ephemeral --skip-git-repo-check -C "$runtime" --sandbox read-only \
+    --model "$CODEX_MODEL" -c "model_reasoning_effort=$(jq -Rn --arg e "$REASONING_EFFORT" '$e')" \
+    -c "developer_instructions=$(jq -Rn --arg s "$instructions" '$s')" \
+    -c project_doc_max_bytes=0 -c 'web_search="disabled"' \
+    -c skills.include_instructions=false -c 'shell_environment_policy.inherit="none"' \
+    -c allow_login_shell=false \
+    --disable apps --disable plugins --disable hooks --disable multi_agent \
+    --disable multi_agent_v2 -c agents.enabled=false \
+    --disable browser_use --disable computer_use --disable image_generation \
+    --disable memories --disable skill_search --enable skip_host_skill_discovery \
+    --disable shell_snapshot --disable workspace_dependencies \
+    --output-last-message "$runtime/result" \
+    "The untrusted PR checkout to read is: $dir" \
+    <"$prompt" >"$runtime/stdout" 2>"$runtime/stderr"
+  prc=$?
+  if [[ $prc -eq 0 && -s $runtime/result ]]; then
+    cat "$runtime/result"
+  else
+    echo "--- $persona: Codex failed or returned no final message ---" >&2
+    tail -20 "$runtime/stderr" >&2
+    prc=1
+  fi
+  rm -rf "$runtime"
+  return "$prc"
+}
+
+run_persona() { # run_persona <persona> <dir> <prompt-file>
+  local output
+  case $REVIEW_BACKEND in
+    codex)
+      if output=$(run_codex "$@") && [[ -n ${output//[[:space:]]/} ]]; then
+        REVIEW_MODEL="$CODEX_MODEL"
+        printf '%s\n' "$output"
+        return 0
+      fi
+      echo "Codex unavailable; retrying with Claude ($CLAUDE_MODEL)" >&2
+      ;;
+    claude) ;;
+    *) echo "ERROR: REVIEW_BACKEND must be codex or claude" >&2; return 1 ;;
+  esac
+  output=$(run_claude "$@") || return 1
+  [[ -n ${output//[[:space:]]/} ]] || return 1
+  REVIEW_MODEL="$CLAUDE_MODEL"
+  printf '%s\n' "$output"
 }
 
 # gh --paginate emits one JSON array per page rather than one array overall, so
@@ -358,7 +425,7 @@ post_handoff() { # post_handoff <repo> <number> <head> <verdict> <body>
     '{slug: $slug, title: $title}' |
     handoff_api POST "/api/folders" || return 1
   jq -n --arg title "$repo#$number security review @ ${head:0:8}" \
-        --arg note "$CLAUDE_MODEL/$REASONING_EFFORT via pr-reviewer" \
+        --arg note "$REVIEW_MODEL/$REASONING_EFFORT via pr-reviewer" \
         --arg body "$body" --arg status "$status" \
     '{title: $title, format: "md", author_note: $note, body: $body, status: $status}' |
     handoff_api POST "/api/folders/$slug/posts" || return 1
@@ -376,7 +443,7 @@ deliver_full_finding() { # deliver_full_finding <repo> <number> <head> <verdict>
     if [[ -n ${DRY_RUN:-} ]]; then
       echo "would post the full finding for $repo#$number to $HANDOFF_URL/f/$(handoff_slug "$repo" "$number")" >&2
     elif url=$(post_handoff "$repo" "$number" "$head" "$verdict" \
-        "$(handoff_post_body "$repo" "$number" "$head" "$CLAUDE_MODEL" "$verdict" "$body")"); then
+        "$(handoff_post_body "$repo" "$number" "$head" "$REVIEW_MODEL" "$verdict" "$body")"); then
       echo "full finding for $repo#$number posted to $url" >&2
       printf '%s' "$url"
       return 0
@@ -396,6 +463,8 @@ deliver_full_finding() { # deliver_full_finding <repo> <number> <head> <verdict>
 
 review_pr() { # review_pr <repo> <number> <runner-login>
   local repo="$1" number="$2" runner="$3"
+  local REVIEW_MODEL="$CODEX_MODEL"
+  [[ $REVIEW_BACKEND == claude ]] && REVIEW_MODEL="$CLAUDE_MODEL"
   local head_sha comments threads reviews replies newest dir persona pc body_text state_head state_seen
   local prior url out verdict body stripped report_ref cleared=0 lines="" truncated="" rc=0 repo_json
   local t0
@@ -471,12 +540,13 @@ review_pr() { # review_pr <repo> <number> <runner-login>
     # the tick looks hung; report the elapsed time after, so slow ones are visible.
     t0=$SECONDS
     log_pr '' "$repo#$number" \
-      "$persona: running ${PERSONA_SKILL[$persona]} ($CLAUDE_MODEL/$REASONING_EFFORT)…"
-    out=$(run_persona "$persona" "$dir" "$WORK_DIR/prompt.$$") || {
+      "$persona: running ${PERSONA_SKILL[$persona]} ($REVIEW_BACKEND/$REASONING_EFFORT)…"
+    run_persona "$persona" "$dir" "$WORK_DIR/prompt.$$" >"$WORK_DIR/output.$$" || {
       log_pr '' "$repo#$number" "$persona: FAILED after $((SECONDS - t0))s"
       rc=1
       continue
     }
+    out=$(cat "$WORK_DIR/output.$$")
     [[ -n $out ]] || {
       log_pr '' "$repo#$number" "$persona: empty output after $((SECONDS - t0))s"
       rc=1
@@ -493,7 +563,7 @@ review_pr() { # review_pr <repo> <number> <runner-login>
     else
       body=$(redact_findings "$persona" "$IS_PUBLIC" "$stripped")
     fi
-    render_comment "$persona" "$CLAUDE_MODEL" "$head_sha" "${newest:-$NO_REPLIES}" "$verdict" \
+    render_comment "$persona" "$REVIEW_MODEL" "$head_sha" "${newest:-$NO_REPLIES}" "$verdict" \
       "$body$truncated" >"$WORK_DIR/body.$$"
     upsert_comment "$repo" "$number" "$url" "$WORK_DIR/body.$$" || rc=1
   done
@@ -508,6 +578,7 @@ review_pr() { # review_pr <repo> <number> <runner-login>
   pc=$(persona_comment "$comments" summary "$runner")
   url=$(jq -r '.url // empty' <<<"${pc:-null}")
   render_summary "$head_sha" "${newest:-$NO_REPLIES}" "$cleared" "$lines" >"$WORK_DIR/body.$$"
+  printf '\n---\n%s\n' "$(signature "$REVIEW_MODEL" "${PERSONA_SKILL[security]}")" >>"$WORK_DIR/body.$$"
   upsert_comment "$repo" "$number" "$url" "$WORK_DIR/body.$$" || rc=1
 
   log_pr 'done' "$repo#$number" "$cleared/${#PERSONA_ORDER[@]} personas cleared"
@@ -518,7 +589,12 @@ main() {
   command -v gh >/dev/null || { echo "ERROR: gh is required" >&2; exit 1; }
   command -v jq >/dev/null || { echo "ERROR: jq is required" >&2; exit 1; }
   command -v git >/dev/null || { echo "ERROR: git is required" >&2; exit 1; }
-  command -v claude >/dev/null || { echo "ERROR: claude is required" >&2; exit 1; }
+  case $REVIEW_BACKEND in
+    codex) command -v codex >/dev/null || command -v claude >/dev/null ||
+      { echo "ERROR: codex or the claude fallback is required" >&2; exit 1; } ;;
+    claude) command -v claude >/dev/null || { echo "ERROR: claude is required" >&2; exit 1; } ;;
+    *) echo "ERROR: REVIEW_BACKEND must be codex or claude" >&2; exit 1 ;;
+  esac
   gh auth status >/dev/null 2>&1 ||
     { echo "ERROR: gh is not authenticated; run 'gh auth login'" >&2; exit 1; }
 

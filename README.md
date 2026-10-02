@@ -29,13 +29,15 @@ satisfy branch protection and merging stays your decision.
 
 ## Setup
 
-Requires bash 4+, `gh`, `jq`, `git`, and the `claude` CLI, plus `curl` if you
-post findings to a hand-off board. macOS ships bash 3.2, which cannot run this;
+Requires bash 4+, `gh`, `jq`, `git`, and the `codex` CLI. Keep `claude`
+installed and authenticated for automatic fallback. `curl` is needed for the
+isolation check and to post findings to a hand-off board. macOS ships bash 3.2, which cannot run this;
 `brew install bash` is enough, and the script re-execs itself under it wherever
 your PATH happens to put it. `gh` must be logged in with `repo` and `read:org`:
 
 ```sh
 gh auth login
+codex login
 ./verify_isolation.sh   # proves the sandboxing still holds; costs a few tokens
 DRY_RUN=1 ./pr-reviewer.sh
 ./install.sh
@@ -56,17 +58,39 @@ logs with `journalctl --user -u pr-reviewer.service`.
 | `DRY_RUN` | unset | Print comment bodies instead of posting them |
 | `HANDOFF_URL` | empty | Hand-off board base URL; unset means deliver full findings to a local file instead |
 | `HANDOFF_TOKEN` | empty | Bearer token for that board; both must be set for board delivery |
-| `CLAUDE_MODEL` | `claude-opus-5-5` | Model for every persona |
+| `REVIEW_BACKEND` | `codex` | Primary runner; set `claude` to use Claude directly |
+| `CODEX_MODEL` | `gpt-6.1-sol` | Primary review model |
+| `CLAUDE_MODEL` | `claude-opus-5-5` | Claude fallback model |
+| `SECURITY_SKILL_FILE` | `$CODEX_HOME/skills/security-audit/SKILL.md` (home defaults to `~/.codex`) | Trusted local skill supplied to Codex; install its companion files alongside it |
 | `REASONING_EFFORT` | `high` | Effort for every persona |
 | `WORK_DIR` | `$XDG_RUNTIME_DIR/pr-reviewer`, or `/tmp/pr-reviewer` | Throwaway checkout directory; basename must be `pr-reviewer` because the reaper refuses to delete from directories it cannot confirm are its own |
 
 An unchanged pull request costs nothing beyond four API calls; only a changed
 one spends tokens.
 
+Codex is tried first for each review. If it is missing, fails, or returns no
+final message, the runner retries once with Claude. If both fail, no persona
+comment is replaced and the tick continues with other PRs. Findings do not
+trigger fallback. Comments and delivered reports identify the model that
+actually produced the review. Both runners use `REASONING_EFFORT`.
+
 ## How PR code is contained
 
-Each review runs against a throwaway shallow clone of the PR head, with the
-persona invoked as:
+Each review reads a throwaway shallow clone of the PR head. Codex starts in
+a separate empty directory so checkout configuration cannot load. It ignores
+user configuration and execution rules, suppresses automatic instruction and
+skill discovery, and receives the trusted security skill explicitly. Plugins,
+apps, hooks, browser/computer tools, web search, and delegation are disabled.
+The command environment inherits no operator variables or login-shell setup.
+
+Codex uses the OS read-only sandbox with approval set to `never`: it can run
+commands to read context, but cannot write files or access the network through
+those commands. This differs from Claude's tool allowlist, which exposes no
+shell at all. `verify_isolation.sh` exercises the production Codex invocation
+against hostile instruction/config files and attempts actual writes and
+network access. Run it on every operator machine; sandbox support is required.
+
+Claude retains this invocation:
 
 ```
 claude -p --no-session-persistence --strict-mcp-config --setting-sources user \
@@ -82,11 +106,10 @@ Three properties this relies on were measured, not assumed, and are re-checked b
 - `--tools` alone does not restrict MCP tools; without `--strict-mcp-config` a
   reviewer is offered Gmail, Firebase deploy, and Playwright code execution.
 
-Belt and braces: `CLAUDE.md`, `AGENTS.md`, and `.claude/` in the
+Belt and braces: `CLAUDE.md`, `AGENTS.md`, `.claude/`, `.codex/`, and `.agents/` in the
 checkout are renamed with a `.quarantined` suffix before review, so they are
-readable as data but are not auto-loaded. There is no Bash, Write, or network
-tool, so a successful injection can only produce misleading text; the runner, not
-the model, owns the comment envelope and signature.
+readable as data but are not auto-loaded. The runner owns the comment envelope
+and model signature; neither reviewer receives GitHub write tools.
 
 On public repositories the `security` persona posts severity and file only.
 Posting an unfixed exploitable finding to a public comment is disclosure. The
