@@ -37,11 +37,11 @@ needs_review() { # needs_review <state-head> <state-seen> <current-head> <newest
   return 1
 }
 
-# Security only. simplicity/ponytail-review and hostile/hostile-review were
+# simplicity/ponytail-review and hostile/hostile-review were
 # dropped: they never cleared, so the gate was never passable.
-PERSONA_ORDER=(security)
-declare -A PERSONA_SKILL=([security]=security-audit)
-declare -A PERSONA_TITLE=([security]="Security review")
+PERSONA_ORDER=(security code-review)
+declare -A PERSONA_SKILL=([security]=security-audit [code-review]=code-review)
+declare -A PERSONA_TITLE=([security]="Security review" [code-review]="Code review")
 
 signature() { # signature <model> <skill>
   printf '*%s using %s on behalf of Yoshi*' "$1" "$2"

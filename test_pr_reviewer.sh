@@ -117,7 +117,8 @@ rc "first reply with empty seen needs review" 0 needs_review abc "" abc "$T1"
 
 # --- persona table ---
 eq "security uses the security-audit skill" security-audit "${PERSONA_SKILL[security]}"
-eq "security is the only persona" 1 "${#PERSONA_ORDER[@]}"
+eq "both review personas are enabled" "security code-review" "${PERSONA_ORDER[*]}"
+eq "code-review uses its own skill" code-review "${PERSONA_SKILL[code-review]}"
 
 # --- signature ---
 SIG=$(signature claude-opus-5 security-audit)
@@ -140,7 +141,7 @@ contains "cleared comment records the verdict in state" "$CLEARED" 'verdict=clea
 
 # --- render_summary ---
 S=$(render_summary abc123 2026-08-26T09:00:00Z 0 '- security: changes required')
-contains "summary reports the tally" "$S" '0/1 personas cleared'
+contains "summary reports the tally" "$S" '0/2 personas cleared'
 contains "summary is a summary state block" "$S" 'persona=summary'
 contains "summary lists each persona" "$S" '- security: changes required'
 
@@ -244,6 +245,14 @@ PATH="$STUB/bin:$PATH"
 source ./pr-reviewer.sh
 eq "Codex is the default backend" codex "$REVIEW_BACKEND"
 eq "6.1 Sol is the default model" gpt-6.1-sol "$CODEX_MODEL"
+parse_args --backend claude
+eq "--backend overrides the environment" claude "$REVIEW_BACKEND"
+eq "--backend claude signs as Claude" "$CLAUDE_MODEL" "$REVIEW_MODEL"
+parse_args --backend=codex
+eq "--backend= form selects Codex" "$CODEX_MODEL" "$REVIEW_MODEL"
+rc "--backend without a value is rejected" 1 parse_args --backend
+rc "unknown argument is rejected" 1 parse_args --claude
+rc "invalid backend is rejected at startup" 1 ./pr-reviewer.sh --backend bogus
 # Existing cases exercise the retained Claude path; Codex/fallback cases below
 # provide their own stub. Never let the dependency-free suite run a real CLI.
 REVIEW_BACKEND=claude
@@ -517,7 +526,7 @@ cat >"$STUB/bin/codex" <<'STUBEOF'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >"$STUB_ARGS"
 cat >"$STUB_ARGS.stdin"
-[[ ${STUB_CODEX_FAIL:-0} == 1 ]] && { echo 'partial untrusted output'; exit 1; }
+[[ ${STUB_CODEX_FAIL:-0} == 1 || ( ${STUB_CODEX_FAIL_CODE_REVIEW:-0} == 1 && $* == *'Trusted code-review instructions'* ) ]] && { echo 'partial untrusted output'; exit 1; }
 while [[ $# -gt 0 ]]; do
   if [[ $1 == --output-last-message ]]; then
     [[ ${STUB_CODEX_EMPTY:-0} == 1 ]] || printf 'Astra review\nVERDICT: CLEARED\n' >"$2"
@@ -530,6 +539,8 @@ STUBEOF
 chmod +x "$STUB/bin/codex"
 SECURITY_SKILL_FILE="$STUB/security-skill.md"
 echo 'Trusted security-audit instructions' >"$SECURITY_SKILL_FILE"
+CODE_REVIEW_SKILL_FILE="$STUB/code-review-skill.md"
+echo 'Trusted code-review instructions' >"$CODE_REVIEW_SKILL_FILE"
 REVIEW_BACKEND=codex
 run_persona security "$QDIR" "$STUB/prompt" >"$STUB/result"
 eq "Codex success identifies Astra" "$CODEX_MODEL" "$REVIEW_MODEL"
@@ -547,6 +558,13 @@ contains "Codex receives the review prompt" "$(cat "$STUB_ARGS.stdin")" 'task te
 for feature in apps plugins hooks multi_agent browser_use computer_use; do
   contains "Codex disables $feature" "$ARGS" "$(printf '%s\n%s' --disable "$feature")"
 done
+run_persona code-review "$QDIR" "$STUB/prompt" >"$STUB/result"
+CODE_ARGS=$(cat "$STUB_ARGS")
+contains "code-review gets its trusted skill" "$CODE_ARGS" 'Trusted code-review instructions'
+lacks "code-review does not receive security skill contents" "$CODE_ARGS" 'Trusted security-audit instructions'
+contains "code-review uses sequential axes" "$CODE_ARGS" 'perform the Standards and Spec axes sequentially'
+contains "code-review keeps missing-spec behaviour" "$CODE_ARGS" 'no spec available'
+contains "code-review keeps delegation disabled" "$CODE_ARGS" 'agents.enabled=false'
 STUB_CODEX_FAIL=1 run_persona security "$QDIR" "$STUB/prompt" >"$STUB/result" 2>/dev/null
 eq "fallback signs as Claude" "$CLAUDE_MODEL" "$REVIEW_MODEL"
 lacks "failed Codex output is discarded" "$(cat "$STUB/result")" 'partial untrusted'
@@ -805,7 +823,11 @@ cat >"$STUB/bin/gh" <<'STUBEOF'
 #!/usr/bin/env bash
 echo "$*" >>"$STUB_GH_LOG"
 case "$1 $2" in
-  "pr view") echo "$STUB_HEAD_SHA" ;;
+  "pr view")
+    case "$*" in
+      *title,body,baseRefOid*) echo '{"title":"Implement token verification","body":"SPEC_CONTEXT require signed tokens","baseRefOid":"base123"}' ;;
+      *) echo "$STUB_HEAD_SHA" ;;
+    esac ;;
   "repo view") echo "$STUB_REPO_JSON" ;;
   # The three reply endpoints answer separately: a stub that returned the same
   # file for all of them would hide a caller that fetched the wrong one.
@@ -841,6 +863,7 @@ case "$*" in
 VERDICT: CHANGES_REQUIRED
 FINDING
     ;;
+  *code-review*) printf '## Standards\nNo findings.\n## Spec\nNo findings.\nVERDICT: CLEARED\n' ;;
 esac
 STUBEOF
 chmod +x "$STUB/bin/claude"
@@ -859,8 +882,13 @@ OUT_A=$(review_pr yoshi/alpha 1 yoshi)
 contains "review_pr renders security's state block with the head sha" "$OUT_A" \
   'persona=security head=abc123'
 contains "security comment is signed" "$OUT_A" "$(signature "$CLAUDE_MODEL" security-audit)"
+contains "code-review maintains a separate comment" "$OUT_A" 'persona=code-review head=abc123'
+contains "code-review comment is signed" "$OUT_A" "$(signature "$CLAUDE_MODEL" code-review)"
+contains "code-review receives spec context" "$(cat "$STUB_CLAUDE_LOG")" 'SPEC_CONTEXT'
+contains "code-review keeps both axes" "$OUT_A" '## Spec'
+eq "first review renders two persona comments and one summary" 3 "$(grep -c '^<!-- pr-reviewer persona=' <<<"$OUT_A")"
 
-contains "summary reports the correct tally" "$OUT_A" '0/1 personas cleared'
+contains "summary reports the correct tally" "$OUT_A" '1/2 personas cleared'
 
 lacks "public redaction hides the Problem text" "$OUT_A" 'SECRETDETAIL'
 lacks "public redaction hides the Fix text" "$OUT_A" 'SECRETFIX'
@@ -880,6 +908,19 @@ eq "the local security report is owner-readable only" 600 \
   "$(file_mode "$REPORT_PATH_A")"
 contains "the public comment names the actual report path" "$OUT_A" "$REPORT_PATH_A"
 
+# Adding the new persona to a PR with a current security review runs only it.
+CURRENT_SECURITY=$(render_comment security "$CLAUDE_MODEL" abc123 "$NO_REPLIES" cleared 'ok')
+jq -n --arg b "$CURRENT_SECURITY" \
+  '[{user:{login:"yoshi"}, url:"https://api/comments/10", body:$b}]' \
+  >"$STUB/comments-security-only.json"
+export STUB_COMMENTS_FILE="$STUB/comments-security-only.json"
+: >"$STUB_CLAUDE_LOG"
+ONLY_CODE=$(review_pr yoshi/alpha 1 yoshi)
+contains "missing code-review runs independently" "$ONLY_CODE" 'persona=code-review head=abc123'
+lacks "current security review is not repeated" "$(cat "$STUB_CLAUDE_LOG")" 'security-audit'
+contains "summary retains cached security verdict" "$ONLY_CODE" '2/2 personas cleared'
+lacks "current security comment is not rewritten" "$ONLY_CODE" 'persona=security head='
+
 # --- Test B: security already cleared against an older head, so the push
 # re-opens it; private repo this time, so nothing is redacted ---
 STALE_PRIOR=$(render_comment security "$CLAUDE_MODEL" oldsha "$NO_REPLIES" cleared 'Nothing left.')
@@ -896,7 +937,7 @@ OUT_B=$(review_pr yoshi/alpha 1 yoshi)
 
 contains "security is re-invoked after the head moves" "$(cat "$STUB_CLAUDE_LOG")" 'security-audit'
 contains "the re-review supersedes the stale cleared verdict" "$OUT_B" '- security: open'
-contains "tally reflects the reopened verdict" "$OUT_B" '0/1 personas cleared'
+contains "tally reflects the reopened verdict" "$OUT_B" '1/2 personas cleared'
 
 contains "private repo publishes the finding in full (no redaction)" "$OUT_B" 'SECRETDETAIL'
 lacks "DRY_RUN never invokes gh with --method (test B)" "$(cat "$STUB_GH_LOG")" '--method'
@@ -978,7 +1019,9 @@ export DRY_RUN=1
 cat >"$STUB/comments-current.json" <<'JSON'
 [
  {"id":1,"url":"u1","updated_at":"2026-08-26T09:00:00Z","user":{"login":"yoshi"},
-  "body":"<!-- pr-reviewer persona=security head=abc123 seen=1970-01-01T00:00:00Z verdict=cleared -->\nok"}
+  "body":"<!-- pr-reviewer persona=security head=abc123 seen=1970-01-01T00:00:00Z verdict=cleared -->\nok"},
+ {"id":2,"url":"u2","updated_at":"2026-08-26T09:00:00Z","user":{"login":"yoshi"},
+  "body":"<!-- pr-reviewer persona=code-review head=abc123 seen=1970-01-01T00:00:00Z verdict=cleared -->\nok"}
 ]
 JSON
 export STUB_COMMENTS_FILE="$STUB/comments-current.json"
@@ -1020,8 +1063,10 @@ contains "the new state records the inline reply as seen" "$OUT_D" \
 # ...and once seen, it must not re-trigger on the next tick, or every inline
 # reply would buy a review forever.
 STATE_D=$(render_comment security "$CLAUDE_MODEL" abc123 '2026-08-26T12:00:00Z' open 'still open')
-jq -n --arg b "$STATE_D" \
-  '[{id:1, user:{login:"yoshi"}, url:"u1", updated_at:"2026-08-26T12:30:00Z", body:$b}]' \
+CODE_STATE_D=$(render_comment code-review "$CLAUDE_MODEL" abc123 '2026-08-26T12:00:00Z' cleared 'ok')
+jq -n --arg b "$STATE_D" --arg c "$CODE_STATE_D" \
+  '[{id:1, user:{login:"yoshi"}, url:"u1", updated_at:"2026-08-26T12:30:00Z", body:$b},
+    {id:2, user:{login:"yoshi"}, url:"u2", updated_at:"2026-08-26T12:30:00Z", body:$c}]' \
   >"$STUB/comments-saw-thread.json"
 export STUB_COMMENTS_FILE="$STUB/comments-saw-thread.json"
 : >"$STUB_CLAUDE_LOG"
@@ -1051,6 +1096,10 @@ REVIEW_BACKEND=codex
 CODEX_REVIEW=$(review_pr yoshi/alpha 1 yoshi)
 contains "Codex persona and summary sign as Astra" "$CODEX_REVIEW" "$(signature "$CODEX_MODEL" security-audit)"
 eq "Codex success does not invoke fallback" '' "$(cat "$STUB_CLAUDE_LOG")"
+MIXED_REVIEW=$(STUB_CODEX_FAIL_CODE_REVIEW=1 review_pr yoshi/alpha 1 yoshi 2>/dev/null)
+contains "mixed backend review signs security as Codex" "$MIXED_REVIEW" "$(signature "$CODEX_MODEL" security-audit)"
+contains "mixed backend review signs code-review as Claude" "$MIXED_REVIEW" "$(signature "$CLAUDE_MODEL" code-review)"
+lacks "mixed backend summary does not misattribute security" "$MIXED_REVIEW" "$(signature "$CLAUDE_MODEL" security-audit)"
 FALLBACK_REVIEW=$(STUB_CODEX_FAIL=1 review_pr yoshi/alpha 1 yoshi 2>/dev/null)
 contains "fallback review signs as Claude" "$FALLBACK_REVIEW" "$(signature "$CLAUDE_MODEL" security-audit)"
 lacks "fallback review never signs as Astra" "$FALLBACK_REVIEW" "$(signature "$CODEX_MODEL" security-audit)"
@@ -1063,6 +1112,50 @@ STUB_CODEX_FAIL=1 review_pr yoshi/alpha 1 yoshi >"$STUB/both-failed" 2>/dev/null
 eq "both backend failures propagate" 1 "$?"
 lacks "both failures leave persona comment untouched" "$(cat "$STUB/both-failed")" '<!-- pr-reviewer persona=security '
 lacks "failed model output is not published" "$(cat "$STUB/both-failed")" 'partial output'
+
+# Standalone Dependabot approvals: exercise filtering and failure isolation
+# without making any GitHub writes.
+cat >"$STUB/bin/gh" <<'STUBEOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+  'repo view')
+    [[ ${STUB_ARCHIVED:-0} == 1 ]] || echo yoshi/alpha
+    ;;
+  'api repos/yoshi/alpha/pulls?state=open&per_page=100')
+    [[ ${STUB_DISCOVERY_FAIL:-0} == 0 ]] || exit 1
+    [[ $3 == --paginate && $4 == --jq ]] || exit 1
+    jq -r "$5" <<'JSON'
+[
+ {"number":1,"user":{"login":"dependabot[bot]"},"draft":false},
+ {"number":2,"user":{"login":"human"},"draft":false},
+ {"number":3,"user":{"login":"dependabot[bot]"},"draft":true},
+ {"number":4,"user":{"login":"dependabot[bot]"},"draft":false}
+]
+JSON
+    ;;
+  'pr review')
+    printf '%s\n' "$*" >>"$STUB_APPROVAL_LOG"
+    [[ ${STUB_APPROVAL_FAIL:-0} == 0 || $3 != 1 ]]
+    ;;
+  *) exit 1 ;;
+esac
+STUBEOF
+export STUB_APPROVAL_LOG="$STUB/approvals.log"
+: >"$STUB_APPROVAL_LOG"
+APPROVAL_PREVIEW=$(DRY_RUN=1 ./approve-dependabot.sh yoshi/alpha)
+eq "only non-draft Dependabot PRs are previewed" \
+  $'Would approve yoshi/alpha#1\nWould approve yoshi/alpha#4' "$APPROVAL_PREVIEW"
+eq "approval dry run makes no writes" '' "$(cat "$STUB_APPROVAL_LOG")"
+rc "approval failure propagates" 1 env DRY_RUN=0 STUB_APPROVAL_FAIL=1 \
+  ./approve-dependabot.sh yoshi/alpha
+contains "approval failure does not stop later PRs" "$(cat "$STUB_APPROVAL_LOG")" \
+  'pr review 4 --repo yoshi/alpha --approve'
+contains "approval identifies its author and principal" "$(cat "$STUB_APPROVAL_LOG")" \
+  'gpt-6.1-sol using ponytail on behalf of Yoshi'
+: >"$STUB_APPROVAL_LOG"
+rc "discovery failure propagates" 1 env STUB_DISCOVERY_FAIL=1 ./approve-dependabot.sh
+rc "archived repository is skipped" 0 env STUB_ARCHIVED=1 ./approve-dependabot.sh
+eq "failed discovery and archived repos make no writes" '' "$(cat "$STUB_APPROVAL_LOG")"
 
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"

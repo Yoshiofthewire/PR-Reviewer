@@ -1,0 +1,22 @@
+name: Dependabot auto-approve
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  approve:
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      # Never check out or execute PR code with this workflow's write token.
+      - name: Approve Dependabot PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: >-
+          gh pr review "$PR_URL" --approve
+          --body "Automated Dependabot approval on behalf of Yoshi. Workflow authored by gpt-6.1-sol using ponytail on behalf of Yoshi."
