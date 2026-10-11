@@ -436,19 +436,24 @@ upsert_comment() { # upsert_comment <repo> <number> <comment-url> <body-file>
   return "$rc"
 }
 
-# Each changed file's full blob SHA at exactly <head>, so any content change in
-# the PR's own files moves it while a merge that leaves them alone does not.
-# Read from a compare of two commit SHAs, never from the PR, which a push can
-# move between reads. Hardened SHA-1 via git; prints nothing when the list
-# cannot vouch for the whole change.
+# Each changed file's full blob SHA and Git mode at exactly <head>, so any
+# content or mode change in the PR's own files moves it while a merge that leaves
+# them alone does not. Read from a compare of two commit SHAs, never from the PR,
+# which a push can move between reads. Hardened SHA-1 via git; prints nothing
+# when the compare cannot vouch for the whole change.
 change_fingerprint() { # change_fingerprint <repo> <base-sha> <head-sha>
-  local files
+  local files diff
   [[ -n $2 && -n $3 ]] || return 0
   files=$(gh api "repos/$1/compare/$2...$3" \
     --jq '.files[] | [.filename, .status, (.sha // ""), (.previous_filename // "")] | @tsv') || return 1
   # A compare lists at most 300 files.
   [[ -n $files && $(wc -l <<<"$files") -lt 300 ]] || return 0
-  LC_ALL=C sort <<<"$files" | git hash-object --stdin
+  # The file list has no modes; the diff's file headers carry them.
+  diff=$(gh api "repos/$1/compare/$2...$3" -H 'Accept: application/vnd.github.diff') || return 0
+  {
+    LC_ALL=C sort <<<"$files"
+    grep -E '^(diff --git |old mode |new mode |new file mode |deleted file mode )' <<<"$diff"
+  } | git hash-object --stdin
 }
 
 HANDOFF_URL="${HANDOFF_URL:-}"

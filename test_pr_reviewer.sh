@@ -916,7 +916,7 @@ case "$1 $2" in
   # list, already in the TSV shape change_fingerprint's --jq produces.
   api\ repos/*/compare/*)
     case "$*" in
-      *vnd.github.diff*) printf 'diff --git a/x b/x\n+added line\n' ;;
+      *vnd.github.diff*) printf 'diff --git a/x b/x\n%s+added line\n' "${STUB_DIFF_MODE:-}" ;;
       *) cat "${STUB_FILES_FILE:-/dev/null}" ;;
     esac ;;
   "api --method")
@@ -1028,8 +1028,10 @@ lacks "DRY_RUN never invokes gh with --method (test B)" "$(cat "$STUB_GH_LOG")" 
 # --- Settle window, carried-forward reviews, and check mode ---
 printf 'auth/verify.go\tmodified\t%s\t\n' 1111111111111111111111111111111111111111 >"$STUB/files1.tsv"
 printf 'auth/verify.go\tmodified\t%s\t\n' 2222222222222222222222222222222222222222 >"$STUB/files2.tsv"
-FP1=$(LC_ALL=C sort "$STUB/files1.tsv" | git hash-object --stdin)
-FP2=$(LC_ALL=C sort "$STUB/files2.tsv" | git hash-object --stdin)
+# What change_fingerprint hashes: the sorted file list, then the diff's file headers.
+stub_fp() { { LC_ALL=C sort "$1"; echo 'diff --git a/x b/x'; } | git hash-object --stdin; }
+FP1=$(stub_fp "$STUB/files1.tsv")
+FP2=$(stub_fp "$STUB/files2.tsv")
 jq -n --arg s "$(render_comment security "$CLAUDE_MODEL" oldsha "$NO_REPLIES" cleared 'Sec ok.' "$FP1")" \
   --arg c "$(render_comment code-review "$CLAUDE_MODEL" oldsha "$NO_REPLIES" cleared 'Code ok.' "$FP1")" \
   '[{user:{login:"yoshi"}, url:"https://api/comments/10", updated_at:"2026-08-26T09:00:00Z", body:$s},
@@ -1051,6 +1053,11 @@ eq "a carried comment keeps one marker" 1 "$(grep -c 'persona=security' <<<"$CAR
 
 STUB_COMMENTS_FILE="$STUB/comments-carry-reply.json" review_pr yoshi/alpha 1 yoshi >/dev/null
 contains "a reply still re-reviews a carried head" "$(cat "$STUB_CLAUDE_LOG")" 'That finding is wrong.'
+
+# Same paths and blobs, but a file became executable: that is a change to review.
+: >"$STUB_CLAUDE_LOG"
+STUB_DIFF_MODE=$'old mode 100644\nnew mode 100755\n' review_pr yoshi/alpha 1 yoshi >/dev/null
+contains "a mode change alone is reviewed" "$(cat "$STUB_CLAUDE_LOG")" 'security-audit'
 
 export STUB_FILES_FILE="$STUB/files2.tsv"
 : >"$STUB_CLAUDE_LOG"
