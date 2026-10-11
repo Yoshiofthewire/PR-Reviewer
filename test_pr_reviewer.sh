@@ -886,6 +886,7 @@ REAL_GIT=$(PATH=${PATH#"$STUB/bin:"} type -P git)
 cat >"$STUB/bin/git" <<'STUBEOF'
 #!/usr/bin/env bash
 [[ $1 == hash-object ]] && exec "$REAL_GIT" "$@"
+[[ $3 == rev-parse ]] && echo "${STUB_FETCHED_SHA:-$STUB_HEAD_SHA}"
 exit 0
 STUBEOF
 chmod +x "$STUB/bin/git"
@@ -900,7 +901,7 @@ case "$1 $2" in
   "pr view")
     case "$*" in
       *title,body,baseRefOid*) echo '{"title":"Implement token verification","body":"SPEC_CONTEXT require signed tokens","baseRefOid":"base123"}' ;;
-      *) printf '%s\t%s\n' "$STUB_HEAD_SHA" "${STUB_UPDATED:-}" ;;
+      *) printf '%s|%s|%s\n' "$STUB_HEAD_SHA" "${STUB_UPDATED:-}" "${STUB_BASE_SHA:-base123}" ;;
     esac ;;
   "repo view") echo "$STUB_REPO_JSON" ;;
   # The three reply endpoints answer separately: a stub that returned the same
@@ -910,11 +911,17 @@ case "$1 $2" in
       */issues/*/comments) cat "$STUB_COMMENTS_FILE" ;;
       */pulls/*/comments) cat "${STUB_THREADS_FILE:-/dev/null}" ;;
       */pulls/*/reviews) cat "${STUB_REVIEWS_FILE:-/dev/null}" ;;
-      # Already in the TSV shape change_fingerprint's --jq produces.
-      */pulls/*/files) cat "${STUB_FILES_FILE:-/dev/null}" ;;
     esac ;;
-  "pr diff") printf 'diff --git a/x b/x\n+added line\n' ;;
-  "api --method") for a; do [[ -f $a ]] && cat "$a" >>"$STUB_GH_LOG"; done ;;
+  # A compare answers with the diff when asked for one, else with the file
+  # list, already in the TSV shape change_fingerprint's --jq produces.
+  api\ repos/*/compare/*)
+    case "$*" in
+      *vnd.github.diff*) printf 'diff --git a/x b/x\n+added line\n' ;;
+      *) cat "${STUB_FILES_FILE:-/dev/null}" ;;
+    esac ;;
+  "api --method")
+    [[ -n ${STUB_POST_FAIL:-} ]] && exit 1
+    for a; do [[ -f $a ]] && cat "$a" >>"$STUB_GH_LOG"; done ;;
 esac
 STUBEOF
 chmod +x "$STUB/bin/gh"
@@ -1037,7 +1044,7 @@ CARRY_OUT=$(review_pr yoshi/alpha 1 yoshi)
 eq "a merge that leaves the changed files alone is up to date" 2 "$?"
 eq "a carried review makes no model call" '' "$(cat "$STUB_CLAUDE_LOG")"
 contains "the security marker moves to the new head" "$CARRY_OUT" \
-  "persona=security head=newsha seen=$NO_REPLIES verdict=cleared diff=$FP1 -->"
+  "persona=security head=newsha seen=$NO_REPLIES verdict=cleared files=$FP1 -->"
 contains "the code-review marker moves too" "$CARRY_OUT" "persona=code-review head=newsha"
 contains "the carried comment keeps its review text" "$CARRY_OUT" 'Sec ok.'
 eq "a carried comment keeps one marker" 1 "$(grep -c 'persona=security' <<<"$CARRY_OUT")"
@@ -1051,7 +1058,24 @@ rc "check mode reports a PR that needs a review" 4 review_pr yoshi/alpha 1 yoshi
 eq "check mode makes no model call" '' "$(cat "$STUB_CLAUDE_LOG")"
 CHANGED_OUT=$(review_pr yoshi/alpha 1 yoshi)
 contains "a change to the PR's own files is reviewed" "$(cat "$STUB_CLAUDE_LOG")" 'security-audit'
-contains "the new review records the new fingerprint" "$CHANGED_OUT" "diff=$FP2 -->"
+contains "the new review records the new fingerprint" "$CHANGED_OUT" "files=$FP2 -->"
+contains "the fingerprint is read for the exact head SHA" "$(cat "$STUB_GH_LOG")" 'compare/base123...newsha --jq'
+contains "the diff is read for the exact head SHA" "$(cat "$STUB_GH_LOG")" \
+  'compare/base123...newsha -H Accept: application/vnd.github.diff'
+
+# A push between reading the head and cloning must not pair the review of one
+# revision with the other's head.
+: >"$STUB_CLAUDE_LOG"
+MOVED_OUT=$(STUB_FETCHED_SHA=pushedsha review_pr yoshi/alpha 1 yoshi 2>"$STUB/moved.err")
+eq "a head that moves mid-tick is left for the next tick" 3 "$?"
+eq "a moved head makes no model call" '' "$(cat "$STUB_CLAUDE_LOG")"
+lacks "a moved head posts no comment" "$MOVED_OUT" 'pr-reviewer persona='
+contains "a moved head says why" "$(cat "$STUB/moved.err")" 'moved past newsha'
+
+# A failed carry must fail the check, not hide behind "needs a review".
+jq '[.[0]]' "$STUB/comments-carry.json" >"$STUB/comments-carry-security.json"
+STUB_FILES_FILE="$STUB/files1.tsv" STUB_COMMENTS_FILE="$STUB/comments-carry-security.json" \
+  STUB_POST_FAIL=1 DRY_RUN="" rc "check mode reports a failed carry" 1 review_pr yoshi/alpha 1 yoshi check
 
 : >"$STUB_CLAUDE_LOG"
 STUB_UPDATED=$(jq -rn 'now - 60 | todate') rc "a PR changed a minute ago is settling" 3 \

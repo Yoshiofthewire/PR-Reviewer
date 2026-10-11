@@ -148,13 +148,18 @@ reap_stale_checkouts() {
 }
 
 # refs/pull/<n>/head resolves for fork PRs too, which a branch name would not.
-prepare_checkout() { # prepare_checkout <repo> <number> <dir>
-  local repo="$1" number="$2" dir="$3"
+# Returns 3 when the PR has moved past <head-sha>; the next tick reviews the new head.
+prepare_checkout() { # prepare_checkout <repo> <number> <dir> <head-sha>
+  local repo="$1" number="$2" dir="$3" head="$4"
   mkdir -p "$dir" || return 1
   git -C "$dir" init -q || return 1
   git -C "$dir" remote add origin "https://github.com/$repo" || return 1
   git -C "$dir" -c protocol.version=2 fetch -q --depth=1 origin \
     "refs/pull/$number/head" || return 1
+  [[ $(git -C "$dir" rev-parse FETCH_HEAD) == "$head" ]] || {
+    echo "$repo#$number moved past ${head:0:8} mid-tick; reviewing it next tick" >&2
+    return 3
+  }
   git -C "$dir" checkout -q FETCH_HEAD || return 1
   quarantine_instructions "$dir" || return 1
   return 0
@@ -431,15 +436,18 @@ upsert_comment() { # upsert_comment <repo> <number> <comment-url> <body-file>
   return "$rc"
 }
 
-# Each changed file's full blob SHA, so any content change in the PR's own files
-# moves it while a merge that leaves those files alone does not. Hardened SHA-1
-# via git; prints nothing when the list cannot vouch for the whole change.
-change_fingerprint() { # change_fingerprint <repo> <number>
+# Each changed file's full blob SHA at exactly <head>, so any content change in
+# the PR's own files moves it while a merge that leaves them alone does not.
+# Read from a compare of two commit SHAs, never from the PR, which a push can
+# move between reads. Hardened SHA-1 via git; prints nothing when the list
+# cannot vouch for the whole change.
+change_fingerprint() { # change_fingerprint <repo> <base-sha> <head-sha>
   local files
-  files=$(gh api --paginate "repos/$1/pulls/$2/files" \
-    --jq '.[] | [.filename, .status, (.sha // ""), (.previous_filename // "")] | @tsv') || return 1
-  # GitHub lists at most 3000 files.
-  [[ -n $files && $(wc -l <<<"$files") -lt 3000 ]] || return 0
+  [[ -n $2 && -n $3 ]] || return 0
+  files=$(gh api "repos/$1/compare/$2...$3" \
+    --jq '.files[] | [.filename, .status, (.sha // ""), (.previous_filename // "")] | @tsv') || return 1
+  # A compare lists at most 300 files.
+  [[ -n $files && $(wc -l <<<"$files") -lt 300 ]] || return 0
   LC_ALL=C sort <<<"$files" | git hash-object --stdin
 }
 
@@ -537,16 +545,19 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
   [[ $REVIEW_BACKEND == claude ]] && REVIEW_MODEL="$CLAUDE_MODEL"
   local head_sha comments threads reviews replies newest dir persona pc body_text
   local prior url out verdict body stripped report_ref cleared=0 lines="" truncated="" rc=0 repo_json
-  local t0 meta updated age fp
+  local t0 meta updated age fp base_sha
   local pr_context="" summary_signatures=""
   # Fixed once: background reviews share $$, and $BASHPID changes inside $(...).
   local tag=$BASHPID
   local -A VERDICTS=() ST_HEAD=() ST_SEEN=() ST_FP=() BODY=() URL=()
   local pending=() kept=()
 
-  meta=$(gh pr view --repo "$repo" "$number" --json headRefOid,updatedAt \
-    --jq '[.headRefOid, .updatedAt] | @tsv') || return 1
-  IFS=$'\t' read -r head_sha updated <<<"$meta"
+  # Read once. The fingerprint, checkout, and diff all derive from these SHAs,
+  # so a push mid-tick cannot pair one revision's review with another's head.
+  meta=$(gh pr view --repo "$repo" "$number" --json headRefOid,updatedAt,baseRefOid \
+    --jq '[.headRefOid, .updatedAt, .baseRefOid] | join("|")') || return 1
+  # "|", not a tab: read merges runs of whitespace separators, shifting fields.
+  IFS='|' read -r head_sha updated base_sha <<<"$meta"
   repo_json=$(gh repo view "$repo" --json isPrivate) || return 1
   IS_PUBLIC=$(visibility_flag "$repo_json")
   comments=$(gh api --paginate "repos/$repo/issues/$number/comments") || return 1
@@ -580,7 +591,7 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
     URL[$persona]=$(jq -r '.url // empty' <<<"${pc:-null}")
     ST_HEAD[$persona]=$(state_field "$body_text" head)
     ST_SEEN[$persona]=$(state_field "$body_text" seen)
-    ST_FP[$persona]=$(state_field "$body_text" diff)
+    ST_FP[$persona]=$(state_field "$body_text" files)
     VERDICTS[$persona]=$(state_field "$body_text" verdict)
     needs_review "${ST_HEAD[$persona]}" "${ST_SEEN[$persona]}" "$head_sha" "$newest" &&
       pending+=("$persona")
@@ -602,7 +613,7 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
 
   # A new head with the same changed files (a clean merge from the base or a
   # stacked parent) carries the existing review forward instead of repeating it.
-  fp=$(change_fingerprint "$repo" "$number") || return 1
+  fp=$(change_fingerprint "$repo" "$base_sha" "$head_sha") || return 1
   for persona in "${pending[@]}"; do
     if needs_review "${ST_HEAD[$persona]}" "${ST_SEEN[$persona]}" "$head_sha" "$newest" \
       "${ST_FP[$persona]}" "$fp"; then
@@ -621,17 +632,22 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
     [[ $rc -eq 0 ]] && return 2
     return 1
   fi
-  [[ $mode == check ]] && return 4
+  if [[ $mode == check ]]; then
+    [[ $rc -eq 0 ]] && return 4
+    return 1
+  fi
   pending=("${kept[@]}")
 
   dir="$WORK_DIR/co-$tag-$number"
   mkdir -p "$WORK_DIR" || return 1
   # shellcheck disable=SC2064
   trap "rm -rf '$dir' '$WORK_DIR'/*.$tag" RETURN
-  prepare_checkout "$repo" "$number" "$dir" || return 1
+  prepare_checkout "$repo" "$number" "$dir" "$head_sha"
+  case $? in 0) ;; 3) return 3 ;; *) return 1 ;; esac
 
   # Scratch files live beside the checkout, never inside it.
-  gh pr diff --repo "$repo" "$number" >"$WORK_DIR/diff.full.$tag" || return 1
+  gh api "repos/$repo/compare/$base_sha...$head_sha" -H 'Accept: application/vnd.github.diff' \
+    >"$WORK_DIR/diff.full.$tag" || return 1
   head -c "$MAX_DIFF_BYTES" "$WORK_DIR/diff.full.$tag" >"$WORK_DIR/diff.$tag" || return 1
   [[ $(wc -c <"$WORK_DIR/diff.full.$tag") -gt $MAX_DIFF_BYTES ]] &&
     truncated=$'\n\n> Review input was truncated; omitted changes were not reviewed.'

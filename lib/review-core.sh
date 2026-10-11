@@ -15,7 +15,7 @@ repo_allowed() { # repo_allowed <repo>
 
 state_emit() { # state_emit <persona> <head> <seen> <verdict> [change-fingerprint]
   printf '<!-- pr-reviewer persona=%s head=%s seen=%s verdict=%s%s -->' "$1" "$2" "$3" "$4" \
-    "${5:+ diff=$5}"
+    "${5:+ files=$5}"
 }
 
 state_field() { # state_field <comment-body> <field>

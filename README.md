@@ -27,6 +27,9 @@ rather than one each. A new head whose changed files are byte-identical to the
 reviewed ones (a clean merge from the base, or from a stacked parent) carries
 the existing review forward: the comment's marker moves to the new head and no
 model runs. Any change to a file the pull request touches is reviewed again.
+The fingerprint, checkout, and diff are all read for the head SHA captured at
+the start, and a head that moves mid-tick is left for the next tick, so a push
+racing the reviewer cannot pair one revision's review with another's head.
 
 It marks each prior finding RESOLVED, UNRESOLVED, or WITHDRAWN, so a correct
 rebuttal can clear a finding without a commit. When nothing actionable remains
