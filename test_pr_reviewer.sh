@@ -269,7 +269,13 @@ eq "oldest updatedAt sorts last" 'yoshi/alpha' "$(tail -1 <<<"$OUT" | cut -f1)"
 
 # --- the per-tick cap counts reviews that ran, not PRs that were looked at ---
 # Stub review_pr: PRs listed in STUB_CURRENT are up to date (rc 2), the rest review (rc 0).
-review_pr() { case " ${STUB_CURRENT:-} " in *" $1#$2 "*) return 2 ;; esac; return 0; }
+# STUB_SETTLING PRs are settling (rc 3); a check of any other PR needs a review (rc 4).
+review_pr() {
+  case " ${STUB_CURRENT:-} " in *" $1#$2 "*) return 2 ;; esac
+  case " ${STUB_SETTLING:-} " in *" $1#$2 "*) return 3 ;; esac
+  [[ ${4:-} == check ]] && return 4
+  return 0
+}
 QUEUE=$'yoshi/beta\t2\tt\tBeta\nyoshi/alpha\t1\tt\tAlpha\norgone/gamma\t3\tt\tGamma'
 MAX_PRS_PER_TICK=2
 CAPLOG=$(STUB_CURRENT='' review_queue yoshi "$QUEUE" 2>&1)
@@ -279,6 +285,38 @@ contains "tick tally counts the deferral" "$CAPLOG" '2 reviewed · 0 up to date 
 FALLLOG=$(STUB_CURRENT='yoshi/beta#2' review_queue yoshi "$QUEUE" 2>&1)
 lacks "an up-to-date PR does not consume a cap slot" "$FALLLOG" 'defer   '
 contains "the next candidate is reviewed instead" "$FALLLOG" '2 reviewed · 1 up to date (VERBOSE=1 to list) · 0 deferred'
+ALLLOG=$(SCAN_ALL=1 STUB_CURRENT='' review_queue yoshi "$QUEUE" 2>&1)
+contains "--all reviews past the cap" "$ALLLOG" '3 reviewed · 0 up to date · 0 deferred'
+SETLOG=$(STUB_SETTLING='yoshi/beta#2' review_queue yoshi "$QUEUE" 2>&1)
+contains "a settling PR takes no cap slot and is tallied" "$SETLOG" \
+  '2 reviewed · 0 up to date · 1 settling · 0 deferred'
+MAX_PRS_PER_TICK=1
+DEFLOG=$(STUB_CURRENT='yoshi/alpha#1' review_queue yoshi "$QUEUE" 2>&1)
+contains "only PRs that need a review count as deferred" "$DEFLOG" \
+  '1 reviewed · 1 up to date (VERBOSE=1 to list) · 1 deferred'
+MAX_PRS_PER_TICK=2
+
+# --- reviews run REVIEW_JOBS at a time, and a background failure is counted ---
+export PAR_LOG="$STUB/par.log"
+review_pr() {
+  [[ ${4:-} == check ]] && return 4
+  echo + >>"$PAR_LOG"; sleep 0.3; echo - >>"$PAR_LOG"
+  [[ $2 == 3 ]] && return 1
+  return 0
+}
+max_parallel() { awk '{ c += ($1 == "+") ? 1 : -1; if (c > m) m = c } END { print m }' "$PAR_LOG"; }
+: >"$PAR_LOG"
+PARLOG=$(SCAN_ALL=1 REVIEW_JOBS=2 review_queue yoshi "$QUEUE" 2>&1)
+eq "two jobs run at once" 2 "$(max_parallel)"
+contains "a failed background review is tallied" "$PARLOG" '2 reviewed · 0 up to date · 0 deferred · 1 failed'
+contains "a failed background review names its PR" "$PARLOG" 'FAILED  orgone/gamma#3'
+: >"$PAR_LOG"
+SCAN_ALL=1 REVIEW_JOBS=1 review_queue yoshi "$QUEUE" 2>/dev/null
+eq "REVIEW_JOBS=1 is sequential" 1 "$(max_parallel)"
+parse_args --all
+eq "--all sets SCAN_ALL" 1 "$SCAN_ALL"
+parse_args
+eq "SCAN_ALL resets without --all" "" "$SCAN_ALL"
 rc "an empty queue is a clean tick" 0 review_queue yoshi ""
 unset -f review_pr
 source ./pr-reviewer.sh
@@ -789,6 +827,37 @@ contains "live run posts a new comment" "$(cat "$STUB_GH_LOG")" 'POST'
 DRY_RUN="" upsert_comment yoshi/alpha 1 "https://api/comments/9" "$STUB/body" >/dev/null
 contains "live run patches an existing comment" "$(cat "$STUB_GH_LOG")" 'PATCH'
 
+# --- a rate-limited gh call pauses and retries instead of failing ---
+cat >"$STUB/bin/gh" <<'STUBEOF'
+#!/usr/bin/env bash
+[[ $1 == api && $2 == rate_limit ]] && exit 0
+n=$(($(cat "$STUB_GH_COUNT") + 1)); echo "$n" >"$STUB_GH_COUNT"
+for a; do [[ -f $a ]] && cat "$a" >>"$STUB_GH_LOG"; done
+if [[ $n -le ${STUB_GH_FAILS:-0} ]]; then
+  echo "partial page $n"
+  echo "${STUB_GH_ERR:-gh: API rate limit exceeded for user ID 1. (HTTP 403)}" >&2
+  exit 1
+fi
+echo "page ok"
+STUBEOF
+chmod +x "$STUB/bin/gh"
+export STUB_GH_COUNT="$STUB/gh.count"
+echo 0 >"$STUB_GH_COUNT"; : >"$STUB_GH_LOG"
+RL=$(GH_PAUSE=0 STUB_GH_FAILS=2 gh api --paginate x 2>"$STUB/rl.err")
+eq "a rate-limited call is retried until it succeeds" 'page ok' "$RL"
+eq "the retries are counted" 3 "$(cat "$STUB_GH_COUNT")"
+contains "the pause is logged" "$(cat "$STUB/rl.err")" 'pausing'
+echo 0 >"$STUB_GH_COUNT"
+rc "retries give up after five attempts" 1 env GH_PAUSE=0 STUB_GH_FAILS=9 bash -c 'source ./pr-reviewer.sh; gh api x >/dev/null 2>&1'
+eq "five attempts are made" 5 "$(cat "$STUB_GH_COUNT")"
+echo 0 >"$STUB_GH_COUNT"
+rc "a non-rate-limit failure is not retried" 1 env STUB_GH_FAILS=9 STUB_GH_ERR='HTTP 406: diff too large' \
+  bash -c 'source ./pr-reviewer.sh; gh pr diff 7 >/dev/null 2>&1'
+eq "it is tried once" 1 "$(cat "$STUB_GH_COUNT")"
+echo 0 >"$STUB_GH_COUNT"; : >"$STUB_GH_LOG"
+GH_PAUSE=0 STUB_GH_FAILS=1 DRY_RUN="" upsert_comment yoshi/alpha 1 "" "$STUB/body" 2>/dev/null
+eq "a rate-limited post resends the same body" 2 "$(grep -c 'body text' "$STUB_GH_LOG")"
+
 # --- visibility_flag must be exactly 0 or 1, and fail closed ---
 # redact_findings gates redaction with a literal comparison against "1"; if this
 # ever produced "true"/"false" instead, or inverted its if/else, redaction would
@@ -810,8 +879,14 @@ eq "empty input fails closed to public" 1 \
 # this drives review_pr end-to-end so a wiring mistake (wrong argument, wrong
 # gate, wrong tally) fails too, not just a re-test of the same unit.
 
+# hash-object goes to the real git: it only hashes stdin, and change
+# fingerprints must match what production computes.
+export REAL_GIT
+REAL_GIT=$(PATH=${PATH#"$STUB/bin:"} type -P git)
 cat >"$STUB/bin/git" <<'STUBEOF'
 #!/usr/bin/env bash
+[[ $1 == hash-object ]] && exec "$REAL_GIT" "$@"
+[[ $3 == rev-parse ]] && echo "${STUB_FETCHED_SHA:-$STUB_HEAD_SHA}"
 exit 0
 STUBEOF
 chmod +x "$STUB/bin/git"
@@ -826,7 +901,7 @@ case "$1 $2" in
   "pr view")
     case "$*" in
       *title,body,baseRefOid*) echo '{"title":"Implement token verification","body":"SPEC_CONTEXT require signed tokens","baseRefOid":"base123"}' ;;
-      *) echo "$STUB_HEAD_SHA" ;;
+      *) printf '%s|%s|%s\n' "$STUB_HEAD_SHA" "${STUB_UPDATED:-}" "${STUB_BASE_SHA:-base123}" ;;
     esac ;;
   "repo view") echo "$STUB_REPO_JSON" ;;
   # The three reply endpoints answer separately: a stub that returned the same
@@ -837,8 +912,16 @@ case "$1 $2" in
       */pulls/*/comments) cat "${STUB_THREADS_FILE:-/dev/null}" ;;
       */pulls/*/reviews) cat "${STUB_REVIEWS_FILE:-/dev/null}" ;;
     esac ;;
-  "pr diff") printf 'diff --git a/x b/x\n+added line\n' ;;
-  "api --method") cat >>"$STUB_GH_LOG" ;;
+  # A compare answers with the diff when asked for one, else with the file
+  # list, already in the TSV shape change_fingerprint's --jq produces.
+  api\ repos/*/compare/*)
+    case "$*" in
+      *vnd.github.diff*) printf 'diff --git a/x b/x\n%s+added line\n' "${STUB_DIFF_MODE:-}" ;;
+      *) cat "${STUB_FILES_FILE:-/dev/null}" ;;
+    esac ;;
+  "api --method")
+    [[ -n ${STUB_POST_FAIL:-} ]] && exit 1
+    for a; do [[ -f $a ]] && cat "$a" >>"$STUB_GH_LOG"; done ;;
 esac
 STUBEOF
 chmod +x "$STUB/bin/gh"
@@ -941,6 +1024,73 @@ contains "tally reflects the reopened verdict" "$OUT_B" '1/2 personas cleared'
 
 contains "private repo publishes the finding in full (no redaction)" "$OUT_B" 'SECRETDETAIL'
 lacks "DRY_RUN never invokes gh with --method (test B)" "$(cat "$STUB_GH_LOG")" '--method'
+
+# --- Settle window, carried-forward reviews, and check mode ---
+printf 'auth/verify.go\tmodified\t%s\t\n' 1111111111111111111111111111111111111111 >"$STUB/files1.tsv"
+printf 'auth/verify.go\tmodified\t%s\t\n' 2222222222222222222222222222222222222222 >"$STUB/files2.tsv"
+# What change_fingerprint hashes: the sorted file list, then the diff's file headers.
+stub_fp() { { LC_ALL=C sort "$1"; echo 'diff --git a/x b/x'; } | git hash-object --stdin; }
+FP1=$(stub_fp "$STUB/files1.tsv")
+FP2=$(stub_fp "$STUB/files2.tsv")
+jq -n --arg s "$(render_comment security "$CLAUDE_MODEL" oldsha "$NO_REPLIES" cleared 'Sec ok.' "$FP1")" \
+  --arg c "$(render_comment code-review "$CLAUDE_MODEL" oldsha "$NO_REPLIES" cleared 'Code ok.' "$FP1")" \
+  '[{user:{login:"yoshi"}, url:"https://api/comments/10", updated_at:"2026-08-26T09:00:00Z", body:$s},
+    {user:{login:"yoshi"}, url:"https://api/comments/11", updated_at:"2026-08-26T09:00:00Z", body:$c}]' \
+  >"$STUB/comments-carry.json"
+jq '. + [{user:{login:"alice"}, url:"https://api/comments/12", updated_at:"2026-08-27T09:00:00Z", body:"That finding is wrong."}]' \
+  "$STUB/comments-carry.json" >"$STUB/comments-carry-reply.json"
+export STUB_COMMENTS_FILE="$STUB/comments-carry.json" STUB_FILES_FILE="$STUB/files1.tsv" STUB_HEAD_SHA=newsha
+
+: >"$STUB_CLAUDE_LOG"
+CARRY_OUT=$(review_pr yoshi/alpha 1 yoshi)
+eq "a merge that leaves the changed files alone is up to date" 2 "$?"
+eq "a carried review makes no model call" '' "$(cat "$STUB_CLAUDE_LOG")"
+contains "the security marker moves to the new head" "$CARRY_OUT" \
+  "persona=security head=newsha seen=$NO_REPLIES verdict=cleared files=$FP1 -->"
+contains "the code-review marker moves too" "$CARRY_OUT" "persona=code-review head=newsha"
+contains "the carried comment keeps its review text" "$CARRY_OUT" 'Sec ok.'
+eq "a carried comment keeps one marker" 1 "$(grep -c 'persona=security' <<<"$CARRY_OUT")"
+
+STUB_COMMENTS_FILE="$STUB/comments-carry-reply.json" review_pr yoshi/alpha 1 yoshi >/dev/null
+contains "a reply still re-reviews a carried head" "$(cat "$STUB_CLAUDE_LOG")" 'That finding is wrong.'
+
+# Same paths and blobs, but a file became executable: that is a change to review.
+: >"$STUB_CLAUDE_LOG"
+STUB_DIFF_MODE=$'old mode 100644\nnew mode 100755\n' review_pr yoshi/alpha 1 yoshi >/dev/null
+contains "a mode change alone is reviewed" "$(cat "$STUB_CLAUDE_LOG")" 'security-audit'
+
+export STUB_FILES_FILE="$STUB/files2.tsv"
+: >"$STUB_CLAUDE_LOG"
+rc "check mode reports a PR that needs a review" 4 review_pr yoshi/alpha 1 yoshi check
+eq "check mode makes no model call" '' "$(cat "$STUB_CLAUDE_LOG")"
+CHANGED_OUT=$(review_pr yoshi/alpha 1 yoshi)
+contains "a change to the PR's own files is reviewed" "$(cat "$STUB_CLAUDE_LOG")" 'security-audit'
+contains "the new review records the new fingerprint" "$CHANGED_OUT" "files=$FP2 -->"
+contains "the fingerprint is read for the exact head SHA" "$(cat "$STUB_GH_LOG")" 'compare/base123...newsha --jq'
+contains "the diff is read for the exact head SHA" "$(cat "$STUB_GH_LOG")" \
+  'compare/base123...newsha -H Accept: application/vnd.github.diff'
+
+# A push between reading the head and cloning must not pair the review of one
+# revision with the other's head.
+: >"$STUB_CLAUDE_LOG"
+MOVED_OUT=$(STUB_FETCHED_SHA=pushedsha review_pr yoshi/alpha 1 yoshi 2>"$STUB/moved.err")
+eq "a head that moves mid-tick is left for the next tick" 3 "$?"
+eq "a moved head makes no model call" '' "$(cat "$STUB_CLAUDE_LOG")"
+lacks "a moved head posts no comment" "$MOVED_OUT" 'pr-reviewer persona='
+contains "a moved head says why" "$(cat "$STUB/moved.err")" 'moved past newsha'
+
+# A failed carry must fail the check, not hide behind "needs a review".
+jq '[.[0]]' "$STUB/comments-carry.json" >"$STUB/comments-carry-security.json"
+STUB_FILES_FILE="$STUB/files1.tsv" STUB_COMMENTS_FILE="$STUB/comments-carry-security.json" \
+  STUB_POST_FAIL=1 DRY_RUN="" rc "check mode reports a failed carry" 1 review_pr yoshi/alpha 1 yoshi check
+
+: >"$STUB_CLAUDE_LOG"
+STUB_UPDATED=$(jq -rn 'now - 60 | todate') rc "a PR changed a minute ago is settling" 3 \
+  review_pr yoshi/alpha 1 yoshi
+STUB_UPDATED=$(jq -rn 'now - 60 | todate') SETTLE_SECONDS=30 rc "a PR quiet past the window is reviewed" 0 \
+  review_pr yoshi/alpha 1 yoshi
+STUB_UPDATED=not-a-date rc "an unreadable updatedAt does not block a review" 0 review_pr yoshi/alpha 1 yoshi
+unset STUB_FILES_FILE
 
 # --- Test C: public repo with the board configured; the full finding goes to
 # the board and the comment links there instead of naming a local path ---
