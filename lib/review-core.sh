@@ -13,8 +13,9 @@ repo_allowed() { # repo_allowed <repo>
   return 1
 }
 
-state_emit() { # state_emit <persona> <head> <seen> <verdict>
-  printf '<!-- pr-reviewer persona=%s head=%s seen=%s verdict=%s -->' "$1" "$2" "$3" "$4"
+state_emit() { # state_emit <persona> <head> <seen> <verdict> [change-fingerprint]
+  printf '<!-- pr-reviewer persona=%s head=%s seen=%s verdict=%s%s -->' "$1" "$2" "$3" "$4" \
+    "${5:+ diff=$5}"
 }
 
 state_field() { # state_field <comment-body> <field>
@@ -26,15 +27,21 @@ state_field() { # state_field <comment-body> <field>
   return 0
 }
 
-# ISO 8601 UTC timestamps compare correctly as strings.
-needs_review() { # needs_review <state-head> <state-seen> <current-head> <newest-reply>
-  local state_head="$1" state_seen="$2" cur_head="$3" newest="$4"
+# ISO 8601 UTC timestamps compare correctly as strings. A new head whose
+# change fingerprint matches the reviewed one (a clean merge from the base)
+# counts as unchanged.
+needs_review() { # needs_review <state-head> <state-seen> <current-head> <newest-reply> [state-fp] [current-fp]
+  local state_head="$1" state_seen="$2" cur_head="$3" newest="$4" state_fp="${5:-}" cur_fp="${6:-}"
   [[ -z $state_head ]] && return 0
-  [[ $state_head != "$cur_head" ]] && return 0
+  [[ $state_head != "$cur_head" && ( -z $state_fp || $state_fp != "$cur_fp" ) ]] && return 0
   [[ -z $newest ]] && return 1
   [[ -z $state_seen ]] && return 0
   [[ $newest > $state_seen ]] && return 0
   return 1
+}
+
+seconds_since() { # seconds_since <iso8601-utc> <now-epoch>; prints nothing for a bad timestamp
+  jq -rn --arg t "$1" --argjson now "$2" '$now - ($t | fromdateiso8601)' 2>/dev/null
 }
 
 # simplicity/ponytail-review and hostile/hostile-review were
@@ -47,12 +54,12 @@ signature() { # signature <model> <skill>
   printf '*%s using %s on behalf of Yoshi*' "$1" "$2"
 }
 
-render_comment() { # render_comment <persona> <model> <head> <seen> <verdict> <body>
-  local persona="$1" model="$2" head="$3" seen="$4" verdict="$5" body="$6" status
+render_comment() { # render_comment <persona> <model> <head> <seen> <verdict> <body> [change-fingerprint]
+  local persona="$1" model="$2" head="$3" seen="$4" verdict="$5" body="$6" fp="${7:-}" status
   status="changes required"
   [[ $verdict == cleared ]] && status="cleared"
   printf '%s\n## %s - %s\n\n%s\n\n---\n%s\n' \
-    "$(state_emit "$persona" "$head" "$seen" "$verdict")" \
+    "$(state_emit "$persona" "$head" "$seen" "$verdict" "$fp")" \
     "${PERSONA_TITLE[$persona]}" "$status" "$body" \
     "$(signature "$model" "${PERSONA_SKILL[$persona]}")"
 }

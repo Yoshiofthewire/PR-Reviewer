@@ -21,6 +21,13 @@ reaches it with its state; a bodiless approval is not a reply. Still not
 triggers: editing the pull request description or title, and anything at all on
 a closed pull request.
 
+A pull request is reviewed once it has been quiet for `SETTLE_SECONDS`, so a fix
+push and the reply announcing it, or a run of quick pushes, cost one review
+rather than one each. A new head whose changed files are byte-identical to the
+reviewed ones (a clean merge from the base, or from a stacked parent) carries
+the existing review forward: the comment's marker moves to the new head and no
+model runs. Any change to a file the pull request touches is reviewed again.
+
 It marks each prior finding RESOLVED, UNRESOLVED, or WITHDRAWN, so a correct
 rebuttal can clear a finding without a commit. When nothing actionable remains
 it reports CLEARED. A summary comment tracks the tally across both personas.
@@ -61,8 +68,9 @@ DRY_RUN=1 ./pr-reviewer.sh
 ```
 
 `install.sh` enables a systemd user timer that runs a tick every five minutes.
-Run one on demand with `systemctl --user start pr-reviewer.service`, and read the
-logs with `journalctl --user -u pr-reviewer.service`.
+Run one on demand with `systemctl --user start pr-reviewer.service`, or review
+every PR that needs it in one go, ignoring `MAX_PRS_PER_TICK`, with
+`./pr-reviewer.sh --all`. Read the logs with `journalctl --user -u pr-reviewer.service`.
 
 ## Configuration
 
@@ -70,7 +78,10 @@ logs with `journalctl --user -u pr-reviewer.service`.
 | --- | --- | --- |
 | `REPOSITORIES` | empty | Comma-separated allowlist; empty means all |
 | `EXCLUDE_REPOSITORIES` | empty | Comma-separated denylist; wins over the allowlist |
-| `MAX_PRS_PER_TICK` | 5 | Pull requests reviewed per tick; already-reviewed ones do not count, the rest are logged and deferred |
+| `MAX_PRS_PER_TICK` | 5 | Pull requests reviewed per tick; up-to-date and settling ones do not count, and only PRs that need a review are deferred; `--all` lifts the cap for one run |
+| `REVIEW_JOBS` | 3 | Reviews run at once |
+| `SETTLE_SECONDS` | 600 | Quiet time after the last push, comment, or review before a pull request is reviewed |
+| `GH_PAUSE` | 60 | Base pause in seconds before retrying a rate-limited GitHub call (×attempt, up to five attempts; waits for the reset when the hourly quota is spent) |
 | `MAX_DIFF_BYTES` | 180000 | Diff truncation threshold in bytes; truncation is stated in the comment |
 | `DRY_RUN` | unset | Print comment bodies instead of posting them |
 | `HANDOFF_URL` | empty | Hand-off board base URL; unset means deliver full findings to a local file instead |
@@ -83,7 +94,7 @@ logs with `journalctl --user -u pr-reviewer.service`.
 | `REASONING_EFFORT` | `high` | Effort for every persona |
 | `WORK_DIR` | `$XDG_RUNTIME_DIR/pr-reviewer`, or `/tmp/pr-reviewer` | Throwaway checkout directory; basename must be `pr-reviewer` because the reaper refuses to delete from directories it cannot confirm are its own |
 
-An unchanged pull request costs nothing beyond four API calls; only a changed
+An unchanged pull request costs nothing beyond five API calls; only a changed
 one spends tokens.
 
 Codex is tried first for each review. If it is missing, fails, or returns no
