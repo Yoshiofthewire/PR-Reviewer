@@ -2,15 +2,15 @@
 
 Reviews every open, non-draft pull request in repositories you own or that
 belong to an organization you are in. Each pull request is reviewed by the
-`security` and `code-review` personas, each maintaining its own comment.
+`security` persona, which posts and maintains its own comment.
 
 | Persona | Skill | Looks for |
 | --- | --- | --- |
 | `security` | `security-audit` | Exploitable defects the change introduces |
-| `code-review` | `code-review` | Repository standards, code smells, and conformance to the PR spec |
 
 The `simplicity` (`ponytail-review`) and `hostile` (`hostile-review`) personas
-were removed: they never cleared, so the gate was never passable.
+were removed: they never cleared, so the gate was never passable. The
+`code-review` persona was removed: it conflicted with `security` and added no value.
 
 The persona re-reviews when the head SHA changes or when anyone replies after
 its last comment. A reply is any of the three places GitHub keeps them — an
@@ -33,14 +33,7 @@ racing the reviewer cannot pair one revision's review with another's head.
 
 It marks each prior finding RESOLVED, UNRESOLVED, or WITHDRAWN, so a correct
 rebuttal can clear a finding without a commit. When nothing actionable remains
-it reports CLEARED. A summary comment tracks the tally across both personas.
-
-Code review keeps Standards and Spec findings separate. It uses the supplied PR
-diff against the base, the PR title/description, and repository spec files.
-Referenced external issues are unavailable in the isolated runner; the review
-states that limitation, or "no spec available" when there is no spec. Both axes
-run sequentially in one session because delegation is disabled. Repository
-standards are read as data, including quarantined instruction files.
+it reports CLEARED. A second comment tracks the tally.
 
 The reviewer posts comments only and never approves a pull request.
 
@@ -93,7 +86,6 @@ every PR that needs it in one go, ignoring `MAX_PRS_PER_TICK`, with
 | `CODEX_MODEL` | `gpt-6.1-sol` | Primary review model |
 | `CLAUDE_MODEL` | `claude-opus-5-5` | Claude fallback model |
 | `SECURITY_SKILL_FILE` | `$CODEX_HOME/skills/security-audit/SKILL.md` (home defaults to `~/.codex`) | Trusted local skill supplied to Codex; install its companion files alongside it |
-| `CODE_REVIEW_SKILL_FILE` | `$CODEX_HOME/skills/code-review/SKILL.md` (home defaults to `~/.codex`) | Trusted code-review skill supplied to Codex; install `code-review` in Claude's user skills for fallback too |
 | `REASONING_EFFORT` | `high` | Effort for every persona |
 | `WORK_DIR` | `$XDG_RUNTIME_DIR/pr-reviewer`, or `/tmp/pr-reviewer` | Throwaway checkout directory; basename must be `pr-reviewer` because the reaper refuses to delete from directories it cannot confirm are its own |
 
@@ -111,7 +103,7 @@ actually produced the review. Both runners use `REASONING_EFFORT`.
 Each review reads a throwaway shallow clone of the PR head. Codex starts in
 a separate empty directory so checkout configuration cannot load. It ignores
 user configuration and execution rules, suppresses automatic instruction and
-skill discovery, and receives only the active persona's trusted skill explicitly. Plugins,
+skill discovery, and receives the trusted security skill explicitly. Plugins,
 apps, hooks, browser/computer tools, web search, and delegation are disabled.
 The command environment inherits no operator variables or login-shell setup.
 

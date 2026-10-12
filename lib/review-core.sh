@@ -44,11 +44,12 @@ seconds_since() { # seconds_since <iso8601-utc> <now-epoch>; prints nothing for 
   jq -rn --arg t "$1" --argjson now "$2" '$now - ($t | fromdateiso8601)' 2>/dev/null
 }
 
-# simplicity/ponytail-review and hostile/hostile-review were
-# dropped: they never cleared, so the gate was never passable.
-PERSONA_ORDER=(security code-review)
-declare -A PERSONA_SKILL=([security]=security-audit [code-review]=code-review)
-declare -A PERSONA_TITLE=([security]="Security review" [code-review]="Code review")
+# Security only. simplicity/ponytail-review and hostile/hostile-review were
+# dropped: they never cleared. code-review was dropped: it conflicted with
+# security and added no value.
+PERSONA_ORDER=(security)
+declare -A PERSONA_SKILL=([security]=security-audit)
+declare -A PERSONA_TITLE=([security]="Security review")
 
 signature() { # signature <model> <skill>
   printf '*%s using %s on behalf of Yoshi*' "$1" "$2"
