@@ -117,8 +117,7 @@ rc "first reply with empty seen needs review" 0 needs_review abc "" abc "$T1"
 
 # --- persona table ---
 eq "security uses the security-audit skill" security-audit "${PERSONA_SKILL[security]}"
-eq "both review personas are enabled" "security code-review" "${PERSONA_ORDER[*]}"
-eq "code-review uses its own skill" code-review "${PERSONA_SKILL[code-review]}"
+eq "security is the only persona" security "${PERSONA_ORDER[*]}"
 
 # --- signature ---
 SIG=$(signature claude-opus-5 security-audit)
@@ -141,7 +140,7 @@ contains "cleared comment records the verdict in state" "$CLEARED" 'verdict=clea
 
 # --- render_summary ---
 S=$(render_summary abc123 2026-08-26T09:00:00Z 0 '- security: changes required')
-contains "summary reports the tally" "$S" '0/2 personas cleared'
+contains "summary reports the tally" "$S" '0/1 personas cleared'
 contains "summary is a summary state block" "$S" 'persona=summary'
 contains "summary lists each persona" "$S" '- security: changes required'
 
@@ -564,7 +563,7 @@ cat >"$STUB/bin/codex" <<'STUBEOF'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >"$STUB_ARGS"
 cat >"$STUB_ARGS.stdin"
-[[ ${STUB_CODEX_FAIL:-0} == 1 || ( ${STUB_CODEX_FAIL_CODE_REVIEW:-0} == 1 && $* == *'Trusted code-review instructions'* ) ]] && { echo 'partial untrusted output'; exit 1; }
+[[ ${STUB_CODEX_FAIL:-0} == 1 ]] && { echo 'partial untrusted output'; exit 1; }
 while [[ $# -gt 0 ]]; do
   if [[ $1 == --output-last-message ]]; then
     [[ ${STUB_CODEX_EMPTY:-0} == 1 ]] || printf 'Astra review\nVERDICT: CLEARED\n' >"$2"
@@ -577,8 +576,6 @@ STUBEOF
 chmod +x "$STUB/bin/codex"
 SECURITY_SKILL_FILE="$STUB/security-skill.md"
 echo 'Trusted security-audit instructions' >"$SECURITY_SKILL_FILE"
-CODE_REVIEW_SKILL_FILE="$STUB/code-review-skill.md"
-echo 'Trusted code-review instructions' >"$CODE_REVIEW_SKILL_FILE"
 REVIEW_BACKEND=codex
 run_persona security "$QDIR" "$STUB/prompt" >"$STUB/result"
 eq "Codex success identifies Astra" "$CODEX_MODEL" "$REVIEW_MODEL"
@@ -596,13 +593,6 @@ contains "Codex receives the review prompt" "$(cat "$STUB_ARGS.stdin")" 'task te
 for feature in apps plugins hooks multi_agent browser_use computer_use; do
   contains "Codex disables $feature" "$ARGS" "$(printf '%s\n%s' --disable "$feature")"
 done
-run_persona code-review "$QDIR" "$STUB/prompt" >"$STUB/result"
-CODE_ARGS=$(cat "$STUB_ARGS")
-contains "code-review gets its trusted skill" "$CODE_ARGS" 'Trusted code-review instructions'
-lacks "code-review does not receive security skill contents" "$CODE_ARGS" 'Trusted security-audit instructions'
-contains "code-review uses sequential axes" "$CODE_ARGS" 'perform the Standards and Spec axes sequentially'
-contains "code-review keeps missing-spec behaviour" "$CODE_ARGS" 'no spec available'
-contains "code-review keeps delegation disabled" "$CODE_ARGS" 'agents.enabled=false'
 STUB_CODEX_FAIL=1 run_persona security "$QDIR" "$STUB/prompt" >"$STUB/result" 2>/dev/null
 eq "fallback signs as Claude" "$CLAUDE_MODEL" "$REVIEW_MODEL"
 lacks "failed Codex output is discarded" "$(cat "$STUB/result")" 'partial untrusted'
@@ -899,10 +889,7 @@ cat >"$STUB/bin/gh" <<'STUBEOF'
 echo "$*" >>"$STUB_GH_LOG"
 case "$1 $2" in
   "pr view")
-    case "$*" in
-      *title,body,baseRefOid*) echo '{"title":"Implement token verification","body":"SPEC_CONTEXT require signed tokens","baseRefOid":"base123"}' ;;
-      *) printf '%s|%s|%s\n' "$STUB_HEAD_SHA" "${STUB_UPDATED:-}" "${STUB_BASE_SHA:-base123}" ;;
-    esac ;;
+    printf '%s|%s|%s\n' "$STUB_HEAD_SHA" "${STUB_UPDATED:-}" "${STUB_BASE_SHA:-base123}" ;;
   "repo view") echo "$STUB_REPO_JSON" ;;
   # The three reply endpoints answer separately: a stub that returned the same
   # file for all of them would hide a caller that fetched the wrong one.
@@ -946,7 +933,6 @@ case "$*" in
 VERDICT: CHANGES_REQUIRED
 FINDING
     ;;
-  *code-review*) printf '## Standards\nNo findings.\n## Spec\nNo findings.\nVERDICT: CLEARED\n' ;;
 esac
 STUBEOF
 chmod +x "$STUB/bin/claude"
@@ -965,13 +951,9 @@ OUT_A=$(review_pr yoshi/alpha 1 yoshi)
 contains "review_pr renders security's state block with the head sha" "$OUT_A" \
   'persona=security head=abc123'
 contains "security comment is signed" "$OUT_A" "$(signature "$CLAUDE_MODEL" security-audit)"
-contains "code-review maintains a separate comment" "$OUT_A" 'persona=code-review head=abc123'
-contains "code-review comment is signed" "$OUT_A" "$(signature "$CLAUDE_MODEL" code-review)"
-contains "code-review receives spec context" "$(cat "$STUB_CLAUDE_LOG")" 'SPEC_CONTEXT'
-contains "code-review keeps both axes" "$OUT_A" '## Spec'
-eq "first review renders two persona comments and one summary" 3 "$(grep -c '^<!-- pr-reviewer persona=' <<<"$OUT_A")"
+eq "first review renders one persona comment and one summary" 2 "$(grep -c '^<!-- pr-reviewer persona=' <<<"$OUT_A")"
 
-contains "summary reports the correct tally" "$OUT_A" '1/2 personas cleared'
+contains "summary reports the correct tally" "$OUT_A" '0/1 personas cleared'
 
 lacks "public redaction hides the Problem text" "$OUT_A" 'SECRETDETAIL'
 lacks "public redaction hides the Fix text" "$OUT_A" 'SECRETFIX'
@@ -991,19 +973,6 @@ eq "the local security report is owner-readable only" 600 \
   "$(file_mode "$REPORT_PATH_A")"
 contains "the public comment names the actual report path" "$OUT_A" "$REPORT_PATH_A"
 
-# Adding the new persona to a PR with a current security review runs only it.
-CURRENT_SECURITY=$(render_comment security "$CLAUDE_MODEL" abc123 "$NO_REPLIES" cleared 'ok')
-jq -n --arg b "$CURRENT_SECURITY" \
-  '[{user:{login:"yoshi"}, url:"https://api/comments/10", body:$b}]' \
-  >"$STUB/comments-security-only.json"
-export STUB_COMMENTS_FILE="$STUB/comments-security-only.json"
-: >"$STUB_CLAUDE_LOG"
-ONLY_CODE=$(review_pr yoshi/alpha 1 yoshi)
-contains "missing code-review runs independently" "$ONLY_CODE" 'persona=code-review head=abc123'
-lacks "current security review is not repeated" "$(cat "$STUB_CLAUDE_LOG")" 'security-audit'
-contains "summary retains cached security verdict" "$ONLY_CODE" '2/2 personas cleared'
-lacks "current security comment is not rewritten" "$ONLY_CODE" 'persona=security head='
-
 # --- Test B: security already cleared against an older head, so the push
 # re-opens it; private repo this time, so nothing is redacted ---
 STALE_PRIOR=$(render_comment security "$CLAUDE_MODEL" oldsha "$NO_REPLIES" cleared 'Nothing left.')
@@ -1020,7 +989,7 @@ OUT_B=$(review_pr yoshi/alpha 1 yoshi)
 
 contains "security is re-invoked after the head moves" "$(cat "$STUB_CLAUDE_LOG")" 'security-audit'
 contains "the re-review supersedes the stale cleared verdict" "$OUT_B" '- security: open'
-contains "tally reflects the reopened verdict" "$OUT_B" '1/2 personas cleared'
+contains "tally reflects the reopened verdict" "$OUT_B" '0/1 personas cleared'
 
 contains "private repo publishes the finding in full (no redaction)" "$OUT_B" 'SECRETDETAIL'
 lacks "DRY_RUN never invokes gh with --method (test B)" "$(cat "$STUB_GH_LOG")" '--method'
@@ -1033,9 +1002,7 @@ stub_fp() { { LC_ALL=C sort "$1"; echo 'diff --git a/x b/x'; } | git hash-object
 FP1=$(stub_fp "$STUB/files1.tsv")
 FP2=$(stub_fp "$STUB/files2.tsv")
 jq -n --arg s "$(render_comment security "$CLAUDE_MODEL" oldsha "$NO_REPLIES" cleared 'Sec ok.' "$FP1")" \
-  --arg c "$(render_comment code-review "$CLAUDE_MODEL" oldsha "$NO_REPLIES" cleared 'Code ok.' "$FP1")" \
-  '[{user:{login:"yoshi"}, url:"https://api/comments/10", updated_at:"2026-08-26T09:00:00Z", body:$s},
-    {user:{login:"yoshi"}, url:"https://api/comments/11", updated_at:"2026-08-26T09:00:00Z", body:$c}]' \
+  '[{user:{login:"yoshi"}, url:"https://api/comments/10", updated_at:"2026-08-26T09:00:00Z", body:$s}]' \
   >"$STUB/comments-carry.json"
 jq '. + [{user:{login:"alice"}, url:"https://api/comments/12", updated_at:"2026-08-27T09:00:00Z", body:"That finding is wrong."}]' \
   "$STUB/comments-carry.json" >"$STUB/comments-carry-reply.json"
@@ -1047,7 +1014,6 @@ eq "a merge that leaves the changed files alone is up to date" 2 "$?"
 eq "a carried review makes no model call" '' "$(cat "$STUB_CLAUDE_LOG")"
 contains "the security marker moves to the new head" "$CARRY_OUT" \
   "persona=security head=newsha seen=$NO_REPLIES verdict=cleared files=$FP1 -->"
-contains "the code-review marker moves too" "$CARRY_OUT" "persona=code-review head=newsha"
 contains "the carried comment keeps its review text" "$CARRY_OUT" 'Sec ok.'
 eq "a carried comment keeps one marker" 1 "$(grep -c 'persona=security' <<<"$CARRY_OUT")"
 
@@ -1169,9 +1135,7 @@ export DRY_RUN=1
 cat >"$STUB/comments-current.json" <<'JSON'
 [
  {"id":1,"url":"u1","updated_at":"2026-08-26T09:00:00Z","user":{"login":"yoshi"},
-  "body":"<!-- pr-reviewer persona=security head=abc123 seen=1970-01-01T00:00:00Z verdict=cleared -->\nok"},
- {"id":2,"url":"u2","updated_at":"2026-08-26T09:00:00Z","user":{"login":"yoshi"},
-  "body":"<!-- pr-reviewer persona=code-review head=abc123 seen=1970-01-01T00:00:00Z verdict=cleared -->\nok"}
+  "body":"<!-- pr-reviewer persona=security head=abc123 seen=1970-01-01T00:00:00Z verdict=cleared -->\nok"}
 ]
 JSON
 export STUB_COMMENTS_FILE="$STUB/comments-current.json"
@@ -1213,10 +1177,8 @@ contains "the new state records the inline reply as seen" "$OUT_D" \
 # ...and once seen, it must not re-trigger on the next tick, or every inline
 # reply would buy a review forever.
 STATE_D=$(render_comment security "$CLAUDE_MODEL" abc123 '2026-08-26T12:00:00Z' open 'still open')
-CODE_STATE_D=$(render_comment code-review "$CLAUDE_MODEL" abc123 '2026-08-26T12:00:00Z' cleared 'ok')
-jq -n --arg b "$STATE_D" --arg c "$CODE_STATE_D" \
-  '[{id:1, user:{login:"yoshi"}, url:"u1", updated_at:"2026-08-26T12:30:00Z", body:$b},
-    {id:2, user:{login:"yoshi"}, url:"u2", updated_at:"2026-08-26T12:30:00Z", body:$c}]' \
+jq -n --arg b "$STATE_D" \
+  '[{id:1, user:{login:"yoshi"}, url:"u1", updated_at:"2026-08-26T12:30:00Z", body:$b}]' \
   >"$STUB/comments-saw-thread.json"
 export STUB_COMMENTS_FILE="$STUB/comments-saw-thread.json"
 : >"$STUB_CLAUDE_LOG"
@@ -1246,10 +1208,6 @@ REVIEW_BACKEND=codex
 CODEX_REVIEW=$(review_pr yoshi/alpha 1 yoshi)
 contains "Codex persona and summary sign as Astra" "$CODEX_REVIEW" "$(signature "$CODEX_MODEL" security-audit)"
 eq "Codex success does not invoke fallback" '' "$(cat "$STUB_CLAUDE_LOG")"
-MIXED_REVIEW=$(STUB_CODEX_FAIL_CODE_REVIEW=1 review_pr yoshi/alpha 1 yoshi 2>/dev/null)
-contains "mixed backend review signs security as Codex" "$MIXED_REVIEW" "$(signature "$CODEX_MODEL" security-audit)"
-contains "mixed backend review signs code-review as Claude" "$MIXED_REVIEW" "$(signature "$CLAUDE_MODEL" code-review)"
-lacks "mixed backend summary does not misattribute security" "$MIXED_REVIEW" "$(signature "$CLAUDE_MODEL" security-audit)"
 FALLBACK_REVIEW=$(STUB_CODEX_FAIL=1 review_pr yoshi/alpha 1 yoshi 2>/dev/null)
 contains "fallback review signs as Claude" "$FALLBACK_REVIEW" "$(signature "$CLAUDE_MODEL" security-audit)"
 lacks "fallback review never signs as Astra" "$FALLBACK_REVIEW" "$(signature "$CODEX_MODEL" security-audit)"
