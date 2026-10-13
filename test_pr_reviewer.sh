@@ -994,6 +994,21 @@ contains "tally reflects the reopened verdict" "$OUT_B" '0/1 personas cleared'
 contains "private repo publishes the finding in full (no redaction)" "$OUT_B" 'SECRETDETAIL'
 lacks "DRY_RUN never invokes gh with --method (test B)" "$(cat "$STUB_GH_LOG")" '--method'
 
+# --- Test C: cleared against an older head, then the re-review fails. The
+# summary is written at the new head, so it must not carry the old verdict. ---
+cp "$STUB/bin/claude" "$STUB/claude.ok"
+printf '#!/usr/bin/env bash\necho "$*" >>"$STUB_CLAUDE_LOG"\nexit 1\n' >"$STUB/bin/claude"
+: >"$STUB_CLAUDE_LOG"
+
+OUT_C=$(review_pr yoshi/alpha 1 yoshi 2>/dev/null)
+
+contains "a failed re-review is attempted" "$(cat "$STUB_CLAUDE_LOG")" 'security-audit'
+contains "a failed re-review is reported as failed" "$OUT_C" '- security: failed'
+contains "a failed re-review is not counted as cleared" "$OUT_C" '0/1 personas cleared'
+lacks "a failed re-review does not carry the old cleared verdict to the new head" "$OUT_C" \
+  'persona=summary head=abc123 seen='"$NO_REPLIES"' verdict=cleared'
+cp "$STUB/claude.ok" "$STUB/bin/claude"
+
 # --- Settle window, carried-forward reviews, and check mode ---
 printf 'auth/verify.go\tmodified\t%s\t\n' 1111111111111111111111111111111111111111 >"$STUB/files1.tsv"
 printf 'auth/verify.go\tmodified\t%s\t\n' 2222222222222222222222222222222222222222 >"$STUB/files2.tsv"

@@ -38,6 +38,9 @@
 - Review state lives in the comment body; GitHub is the only source of truth.
   Add no local state file.
 - Keep exactly one comment per persona per pull request, plus one summary.
+- A persona run that fails or returns nothing is `failed` in the summary. The
+  summary is written at the current head, so it never carries a verdict from an
+  earlier head.
 - Findings carry severity, a changed-file location, failure mode, fix direction,
   and verification.
 - Every comment, note, or reply posted into a pull request must identify the

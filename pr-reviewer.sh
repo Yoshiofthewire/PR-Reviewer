@@ -648,14 +648,18 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
     t0=$SECONDS
     log_pr '' "$repo#$number" \
       "$persona: running ${PERSONA_SKILL[$persona]} ($REVIEW_BACKEND/$REASONING_EFFORT)…"
+    # A failed run must not inherit the verdict seeded from the old comment: the
+    # summary would otherwise report it at the new head as if this head was reviewed.
     run_persona "$persona" "$dir" "$WORK_DIR/prompt.$tag" >"$WORK_DIR/output.$tag" || {
       log_pr '' "$repo#$number" "$persona: FAILED after $((SECONDS - t0))s"
+      VERDICTS[$persona]=failed
       rc=1
       continue
     }
     out=$(cat "$WORK_DIR/output.$tag")
     [[ -n $out ]] || {
       log_pr '' "$repo#$number" "$persona: empty output after $((SECONDS - t0))s"
+      VERDICTS[$persona]=failed
       rc=1
       continue
     }
