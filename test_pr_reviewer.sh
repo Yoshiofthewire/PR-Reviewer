@@ -1085,11 +1085,13 @@ advise_pr_agent() {
   touch "$STUB/adv.started"
   seen "$STUB/persona.started" && touch "$STUB/adv.finished"
 }
-run_persona() {
+watched_run_persona() {
   touch "$STUB/persona.started"
   seen "$STUB/adv.started" && touch "$STUB/adv.beside"
   real_run_persona "$@"
 }
+# Swapped in by eval: older shellcheck rejects a second definition after earlier calls.
+eval 'run_persona() { watched_run_persona "$@"; }'
 PR_AGENT_JOBS="$STUB" PR_AGENT_PUBLIC=1 rc "a review with an advisory succeeds" 0 review_pr yoshi/alpha 1 yoshi
 [[ -e $STUB/adv.beside ]] || fail "the advisory starts before the security review ends"
 [[ -e $STUB/adv.finished ]] || fail "the review waits for an advisory that ran beside it"
