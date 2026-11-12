@@ -15,7 +15,9 @@
   `codex`, and `claude` on `PATH`; it never reaches the network.
 - `verify_isolation.sh` owns proof that the sandboxing still holds. It costs
   tokens and is never run by the tick or the test suite.
-- `systemd/` and `install.sh` own scheduling.
+- `systemd/` and `install.sh` own scheduling on a bare host; `compose.yaml`,
+  `docker/`, and `tick-loop.sh` own it in Docker.
+- `pr-agent-worker.sh` owns the pr-agent container's side of the job hand-off.
 - `README.md` owns operator setup.
 
 ## Local Contracts
@@ -37,7 +39,17 @@
 - Never call `gh pr review --approve`. Comments only.
 - Review state lives in the comment body; GitHub is the only source of truth.
   Add no local state file.
-- Keep exactly one comment per persona per pull request, plus one summary.
+- Keep exactly one comment per persona per pull request, plus one summary and,
+  when `PR_AGENT_JOBS` is set, one pr-agent advisory. The advisory never gates,
+  never counts as a reply, and is skipped on public repositories unless
+  `PR_AGENT_PUBLIC` is set.
+- `STATUS_DIR` is the dashboard's feed, written through `log_pr` and
+  `status_event`. It is display only: never read it back to decide a review, and
+  never write findings to it; the dashboard has no login.
+- pr-agent runs in its own container without a GitHub token. Only
+  `pr-reviewer.sh` talks to GitHub.
+- In Docker the GitHub token lives in `GH_CONFIG_DIR`, never in the environment,
+  and `HIDE_FROM_MODELS` masks that directory from both model CLIs.
 - A persona run that fails or returns nothing is `failed` in the summary. The
   summary is written at the current head, so it never carries a verdict from an
   earlier head.
@@ -81,10 +93,12 @@
 
 - `./test_pr_reviewer.sh`
 - `shellcheck -S warning` on each of `pr-reviewer.sh`, `lib/review-core.sh`,
-  `test_pr_reviewer.sh`, `install.sh`, and `verify_isolation.sh` individually.
+  `test_pr_reviewer.sh`, `install.sh`, `verify_isolation.sh`, `tick-loop.sh`, and
+  `pr-agent-worker.sh` individually.
   Linting them together previously masked a real SC2034 warning.
 - `bash -n pr-reviewer.sh lib/review-core.sh install.sh verify_isolation.sh`
-- `./verify_isolation.sh` after any change to the persona invocation.
+- `./verify_isolation.sh` after any change to the persona invocation; for the
+  Docker stack, `docker compose run --rm reviewer ./verify_isolation.sh`.
 - `DRY_RUN=1 ./pr-reviewer.sh` before any behaviour change goes live.
 
 ## Child DOX Index

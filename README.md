@@ -68,6 +68,51 @@ Run one on demand with `systemctl --user start pr-reviewer.service`, or review
 every PR that needs it in one go, ignoring `MAX_PRS_PER_TICK`, with
 `./pr-reviewer.sh --all`. Read the logs with `journalctl --user -u pr-reviewer.service`.
 
+## Docker
+
+`compose.yaml` runs every reviewer on one host with no CLI logins: both model
+CLIs and pr-agent reach their models through one OpenAI- and Anthropic-compatible
+gateway (CLIProxyAPI or similar).
+
+```sh
+cp .env.example .env && chmod 600 .env                    # gateway URL and key
+mkdir -m 700 gh && gh auth token | GH_CONFIG_DIR=$PWD/gh gh auth login --with-token
+docker compose build
+docker compose run --rm reviewer ./verify_isolation.sh    # costs a few tokens
+docker compose run --rm -e DRY_RUN=1 reviewer ./pr-reviewer.sh
+docker compose up -d
+docker compose logs -f
+```
+
+Run it on one host only; stop the systemd timer first if you used `install.sh`.
+
+| Container | Runs | Holds |
+| --- | --- | --- |
+| `reviewer` | `pr-reviewer.sh` every `TICK_SECONDS` (120) | GitHub login, gateway key |
+| `pr-agent` | [pr-agent](https://github.com/The-PR-Agent/pr-agent) `review` on request | gateway key only |
+| `dashboard` | a static status page on `DASHBOARD_BIND` (`127.0.0.1:8091`) | nothing |
+
+The dashboard shows when the scanner last ran and is next due, every open pull
+request with its state and verdicts, and the last 200 review events. It reads a
+feed the reviewer writes to a shared volume: pull request names, titles and
+verdicts, never findings. It has no login, so it listens on the host only
+unless `DASHBOARD_BIND` names another address; point that at a trusted network.
+
+After the security persona runs on a pull request, the reviewer hands pr-agent a
+two-commit copy of the change over a shared volume and posts what comes back as
+one more comment, marked advisory. It never gates, is refreshed only when the
+head changes, and a failure is retried the next time the security persona runs.
+Public repositories get it only with `PR_AGENT_PUBLIC=1`: unlike the security
+persona, pr-agent's findings are published in full. Its security section is
+switched off either way.
+
+All containers run as uid 1000 with a read-only root and no capabilities. The
+reviewer alone runs with `seccomp=unconfined`: Codex's sandbox needs user
+namespaces, which Docker's default filter refuses. The GitHub login lives in
+`./gh`, mounted at `/gh`, and both model CLIs run with that directory masked, so
+a pull request that talks a model into reading files cannot reach the token. The
+gateway key is in the environment of the model CLIs and is not hidden from them.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -76,7 +121,7 @@ every PR that needs it in one go, ignoring `MAX_PRS_PER_TICK`, with
 | `EXCLUDE_REPOSITORIES` | empty | Comma-separated denylist; wins over the allowlist |
 | `MAX_PRS_PER_TICK` | 5 | Pull requests reviewed per tick; up-to-date and settling ones do not count, and only PRs that need a review are deferred; `--all` lifts the cap for one run |
 | `REVIEW_JOBS` | 3 | Reviews run at once |
-| `SETTLE_SECONDS` | 600 | Quiet time after the last push, comment, or review before a pull request is reviewed |
+| `SETTLE_SECONDS` | 300 | Quiet time after the last push, comment, or review before a pull request is reviewed |
 | `GH_PAUSE` | 60 | Base pause in seconds before retrying a rate-limited GitHub call (×attempt, up to five attempts; waits for the reset when the hourly quota is spent) |
 | `MAX_DIFF_BYTES` | 180000 | Diff truncation threshold in bytes; truncation is stated in the comment |
 | `DRY_RUN` | unset | Print comment bodies instead of posting them |

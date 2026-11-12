@@ -92,5 +92,14 @@ else
   report 'Codex OS sandbox blocks networking' 1
 fi
 
+# Container only: the model CLIs must not be able to read the GitHub token.
+if [[ -n ${HIDE_FROM_MODELS:-} ]]; then
+  token=$(command gh auth token) && [[ -n $token ]]; report 'control: gh has a token outside the jail' $?
+  # shellcheck disable=SC2154  # model_jail comes from pr-reviewer.sh
+  seen=$("${model_jail[@]}" bash -c 'cat /proc/[0-9]*/environ "$1"/* 2>/dev/null | grep -acF "$2"' \
+    _ "$HIDE_FROM_MODELS" "$token")
+  report 'model jail hides the GitHub token (login directory and every environment)' $((seen == 0 ? 0 : 1))
+fi
+
 [[ $fails -eq 0 ]] || { echo "$fails isolation check(s) failed" >&2; exit 1; }
 echo "all isolation checks passed"

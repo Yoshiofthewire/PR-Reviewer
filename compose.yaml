@@ -1,0 +1,93 @@
+# Every reviewer in one stack. Secrets come from .env (mode 600), see README.
+name: pr-reviewers
+
+x-hardening: &hardening
+  restart: unless-stopped
+  user: "1000:1000"
+  cap_drop: [ALL]
+  read_only: true
+  tmpfs: ["/tmp:exec,mode=1777"]
+
+services:
+  reviewer:
+    <<: *hardening
+    build:
+      context: .
+      dockerfile: docker/reviewer.Dockerfile
+    security_opt:
+      - no-new-privileges
+      # Codex's read-only sandbox and the token jail both need user namespaces,
+      # which Docker's default syscall filter refuses. Capabilities stay dropped.
+      - seccomp=unconfined
+    environment:
+      GH_CONFIG_DIR: /gh
+      HIDE_FROM_MODELS: /gh
+      CODEX_BASE_URL: ${MODEL_GATEWAY:?}/v1
+      CODEX_API_KEY: ${MODEL_GATEWAY_KEY:?}
+      ANTHROPIC_BASE_URL: ${MODEL_GATEWAY}
+      ANTHROPIC_AUTH_TOKEN: ${MODEL_GATEWAY_KEY}
+      SECURITY_SKILL_FILE: /home/node/.claude/skills/security-audit/SKILL.md
+      STATUS_DIR: /status
+      TICK_SECONDS: ${TICK_SECONDS:-120}
+      SETTLE_SECONDS: ${SETTLE_SECONDS:-300}
+      PR_AGENT_JOBS: /jobs
+      PR_AGENT_MODEL: ${PR_AGENT_MODEL:-claude-sonnet-5-5}
+      PR_AGENT_PUBLIC: ${PR_AGENT_PUBLIC:-}
+      WORK_DIR: /tmp/pr-reviewer
+      XDG_STATE_HOME: /state
+      HANDOFF_URL: ${HANDOFF_URL:-}
+      HANDOFF_TOKEN: ${HANDOFF_TOKEN:-}
+      REPOSITORIES: ${REPOSITORIES:-}
+      EXCLUDE_REPOSITORIES: ${EXCLUDE_REPOSITORIES:-}
+      REVIEW_BACKEND: ${REVIEW_BACKEND:-codex}
+      DRY_RUN: ${DRY_RUN:-}
+    volumes:
+      - jobs:/jobs
+      - status:/status
+      - ./state:/state
+      - home:/home/node
+      - ./gh:/gh:ro
+      - ${SECURITY_SKILL_DIR:?}:/home/node/.claude/skills/security-audit:ro
+
+  pr-agent:
+    <<: *hardening
+    depends_on: [reviewer]
+    build:
+      context: .
+      dockerfile: docker/pr-agent.Dockerfile
+    security_opt: [no-new-privileges]
+    environment:
+      HOME: /tmp
+      TICK_SECONDS: "5"
+      PR_AGENT_JOBS: /jobs
+      OPENAI__API_BASE: ${MODEL_GATEWAY}/v1
+      OPENAI__KEY: ${MODEL_GATEWAY_KEY}
+      CONFIG__GIT_PROVIDER: local
+      CONFIG__MODEL: openai/${PR_AGENT_MODEL:-claude-sonnet-5-5}
+      CONFIG__FALLBACK_MODELS: "[]"
+      CONFIG__CUSTOM_MODEL_MAX_TOKENS: "200000"
+      CONFIG__MAX_MODEL_TOKENS: "120000"
+      CONFIG__CUSTOM_REASONING_MODEL: "true"
+      PR_REVIEWER__REQUIRE_SECURITY_REVIEW: "false"
+      PR_REVIEWER__EXTRA_INSTRUCTIONS: >-
+        Do not report security vulnerabilities; a separate private security review covers them.
+    volumes:
+      - jobs:/jobs
+
+  # Read-only status page. It shows pull request titles without a login, so it
+  # listens on this machine only unless DASHBOARD_BIND says otherwise.
+  dashboard:
+    <<: *hardening
+    depends_on: [reviewer]
+    build:
+      context: .
+      dockerfile: docker/dashboard.Dockerfile
+    security_opt: [no-new-privileges]
+    ports: ["${DASHBOARD_BIND:-127.0.0.1:8091}:8080"]
+    volumes:
+      - status:/srv/status:ro
+
+volumes:
+  jobs:
+  status:
+  home:
