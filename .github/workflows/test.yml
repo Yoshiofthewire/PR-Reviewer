@@ -12,7 +12,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: shellcheck (individually; linting together previously masked a real SC2034)
         run: |
-          for f in pr-reviewer.sh lib/review-core.sh test_pr_reviewer.sh install.sh verify_isolation.sh; do
+          for f in pr-reviewer.sh lib/review-core.sh test_pr_reviewer.sh install.sh verify_isolation.sh tick-loop.sh pr-agent-worker.sh; do
             shellcheck -S warning "$f"
           done
       - run: ./test_pr_reviewer.sh

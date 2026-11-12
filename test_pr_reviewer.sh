@@ -1071,6 +1071,34 @@ STUB_UPDATED=$(jq -rn 'now - 60 | todate') rc "a PR changed a minute ago is sett
 STUB_UPDATED=$(jq -rn 'now - 60 | todate') SETTLE_SECONDS=30 rc "a PR quiet past the window is reviewed" 0 \
   review_pr yoshi/alpha 1 yoshi
 STUB_UPDATED=not-a-date rc "an unreadable updatedAt does not block a review" 0 review_pr yoshi/alpha 1 yoshi
+
+# pr-agent runs beside the security review, and the review waits for it.
+eval "real_$(declare -f run_persona)"
+eval "real_$(declare -f advise_pr_agent)"
+seen() { # seen <file>: wait up to 5s for it
+  local _
+  for _ in {1..50}; do [[ -e $1 ]] && return 0; sleep 0.1; done
+  return 1
+}
+# Each side waits to see the other running; only concurrent runs both succeed.
+advise_pr_agent() {
+  touch "$STUB/adv.started"
+  seen "$STUB/persona.started" && touch "$STUB/adv.finished"
+}
+watched_run_persona() {
+  touch "$STUB/persona.started"
+  seen "$STUB/adv.started" && touch "$STUB/adv.beside"
+  real_run_persona "$@"
+}
+# Swapped in by eval: older shellcheck rejects a second definition after earlier calls.
+eval 'run_persona() { watched_run_persona "$@"; }'
+PR_AGENT_JOBS="$STUB" PR_AGENT_PUBLIC=1 rc "a review with an advisory succeeds" 0 review_pr yoshi/alpha 1 yoshi
+[[ -e $STUB/adv.beside ]] || fail "the advisory starts before the security review ends"
+[[ -e $STUB/adv.finished ]] || fail "the review waits for an advisory that ran beside it"
+advise_pr_agent() { return 1; }
+PR_AGENT_JOBS="$STUB" PR_AGENT_PUBLIC=1 rc "a failed advisory does not fail the review" 0 review_pr yoshi/alpha 1 yoshi
+eval "$(declare -f real_run_persona | sed '1s/real_//')"
+eval "$(declare -f real_advise_pr_agent | sed '1s/real_//')"
 unset STUB_FILES_FILE
 
 # --- Test C: public repo with the board configured; the full finding goes to
@@ -1279,6 +1307,99 @@ contains "approval identifies its author and principal" "$(cat "$STUB_APPROVAL_L
 rc "discovery failure propagates" 1 env STUB_DISCOVERY_FAIL=1 ./approve-dependabot.sh
 rc "archived repository is skipped" 0 env STUB_ARCHIVED=1 ./approve-dependabot.sh
 eq "failed discovery and archived repos make no writes" '' "$(cat "$STUB_APPROVAL_LOG")"
+
+# --- pr-agent advisory: job hand-off, one comment per head, never a reply ---
+cat >"$STUB/bin/gh" <<'STUBEOF'
+#!/usr/bin/env bash
+echo "$*" >>"$STUB_GH_LOG"
+case "$1 $2" in
+  api\ repos/*/compare/*) echo mergebase123 ;;
+  "api --method") for a; do [[ -f $a ]] && cat "$a" >>"$STUB_GH_LOG"; done ;;
+esac
+exit 0
+STUBEOF
+# Stands in for the pr-agent container: the last git step answers the job.
+cat >"$STUB/bin/git" <<'STUBEOF'
+#!/usr/bin/env bash
+case "$*" in
+  init*) mkdir -p "${@: -1}" ;;
+  *commit-tree*) echo c0ffee ;;
+  *checkout*)
+    [[ -n ${STUB_NO_WORKER:-} ]] && exit 0
+    printf '## PR Reviewer Guide\nlooks fine\n' >"$(dirname "$2")/review.md"
+    touch "$(dirname "$2")/done" ;;
+esac
+exit 0
+STUBEOF
+PR_AGENT_JOBS="$STUB/jobs"; mkdir -p "$PR_AGENT_JOBS"
+export PR_AGENT_MODEL=claude-test
+DRY_RUN=""
+WORK_DIR="$STUB/advwork/pr-reviewer"
+: >"$STUB_GH_LOG"
+rc "advisory posts" 0 advise_pr_agent yoshi/alpha 7 head777 base123 '[]' yoshi
+ADV=$(cat "$STUB_GH_LOG")
+contains "advisory fetches the merge base" "$ADV" 'compare/base123...head777'
+contains "advisory is a new comment" "$ADV" 'api --method POST repos/yoshi/alpha/issues/7/comments'
+contains "advisory carries its marker and head" "$ADV" '<!-- pr-reviewer advisory=pr-agent head=head777 -->'
+contains "advisory carries the review" "$ADV" 'looks fine'
+contains "advisory says it never gates" "$ADV" 'never gates'
+contains "advisory names its model" "$ADV" '*claude-test using pr-agent on behalf of Yoshi*'
+eq "advisory removes its job" '' "$(ls "$PR_AGENT_JOBS")"
+
+ADV_COMMENTS='[{"url":"https://api/c/9","user":{"login":"yoshi"},"updated_at":"2026-09-01T00:00:00Z",
+  "body":"<!-- pr-reviewer advisory=pr-agent head=head777 -->\nold"}]'
+: >"$STUB_GH_LOG"
+rc "advisory at the same head is skipped" 0 advise_pr_agent yoshi/alpha 7 head777 base123 "$ADV_COMMENTS" yoshi
+eq "a skipped advisory calls nothing" '' "$(cat "$STUB_GH_LOG")"
+advise_pr_agent yoshi/alpha 7 head888 base123 "$ADV_COMMENTS" yoshi
+contains "a new head patches the existing advisory" "$(cat "$STUB_GH_LOG")" 'api --method PATCH https://api/c/9'
+eq "the advisory never counts as a reply" '' "$(newest_reply "$ADV_COMMENTS" yoshi)"
+
+: >"$STUB_GH_LOG"
+STUB_NO_WORKER=1 PR_AGENT_TIMEOUT=0 advise_pr_agent yoshi/alpha 7 head999 base123 '[]' yoshi 2>/dev/null
+eq "no answer from pr-agent fails the advisory" 1 $?
+case "$(cat "$STUB_GH_LOG")" in *--method*) fail "a missing review must not post" ;; esac
+eq "a failed advisory removes its job" '' "$(ls "$PR_AGENT_JOBS")"
+
+mkdir -p "$PR_AGENT_JOBS/job.stale"
+reap_stale_checkouts
+eq "stale pr-agent jobs are reaped" '' "$(ls "$PR_AGENT_JOBS")"
+PR_AGENT_JOBS=""
+
+# --- pr-agent worker: answers ready jobs once ---
+cat >"$STUB/bin/python" <<'STUBEOF'
+#!/usr/bin/env bash
+echo run >>"$STUB_PY_LOG"
+echo "review of $(basename "$PWD")" >"$LOCAL__REVIEW_PATH"
+STUBEOF
+chmod +x "$STUB/bin/python"
+export STUB_PY_LOG="$STUB/py.log"; : >"$STUB_PY_LOG"
+mkdir -p "$STUB/wjobs/job.a/repo" "$STUB/wjobs/job.b/repo"
+touch "$STUB/wjobs/job.a/ready"
+PR_AGENT_JOBS="$STUB/wjobs" ./pr-agent-worker.sh
+PR_AGENT_JOBS="$STUB/wjobs" ./pr-agent-worker.sh
+eq "worker reviews a ready job" 'review of repo' "$(cat "$STUB/wjobs/job.a/review.md")"
+eq "worker runs each job once, and only ready ones" 1 "$(lines_of "$(cat "$STUB_PY_LOG")")"
+[[ -e $STUB/wjobs/job.a/done && ! -e $STUB/wjobs/job.b/done ]] || fail "worker marks only the finished job done"
+
+# --- status feed for the dashboard ---
+STATUS_DIR="$STUB/status"; mkdir -p "$STATUS_DIR"
+start_status_feed
+eq "a scan opens the feed with its timings" "120 $SETTLE_SECONDS" "$(jq -r 'select(.a == "tick").d' "$STATUS_DIR/events.jsonl")"
+log_pr check 'yoshi/alpha#7' 'a "quoted" <b>title</b>' 2>/dev/null
+log_pr '' 'yoshi/alpha#7' 'security: running security-audit (codex/high)…' 2>/dev/null
+log_pr '' 'yoshi/alpha#7' 'security: cleared after 30s' 2>/dev/null
+log_pr 'done' 'yoshi/alpha#7' '1/1 personas cleared' 2>/dev/null
+eq "the feed keeps a hostile title as data" 'a "quoted" <b>title</b>' "$(jq -r 'select(.a == "check").d' "$STATUS_DIR/events.jsonl")"
+eq "every feed line is one JSON object" 5 "$(jq -c . "$STATUS_DIR/events.jsonl" | grep -c '')"
+start_status_feed
+eq "the next scan starts an empty feed" 1 "$(lines_of "$(cat "$STATUS_DIR/events.jsonl")")"
+eq "finished reviews move to history" 'security: cleared after 30s|1/1 personas cleared' \
+  "$(jq -r .d "$STATUS_DIR/history.jsonl" | paste -sd'|')"
+eq "a finished review keeps its title" 'a "quoted" <b>title</b>' "$(jq -r 'select(.a == "done").title' "$STATUS_DIR/history.jsonl")"
+STATUS_DIR=""
+log_pr check 'yoshi/alpha#8' 'unrecorded' 2>/dev/null
+eq "no STATUS_DIR, no feed" 1 "$(lines_of "$(cat "$STUB/status/events.jsonl")")"
 
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"

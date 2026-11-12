@@ -31,8 +31,31 @@ SECURITY_SKILL_FILE="${SECURITY_SKILL_FILE:-${CODEX_HOME:-$HOME/.codex}/skills/s
 REVIEW_MODEL="$CODEX_MODEL"
 [[ $REVIEW_BACKEND == claude ]] && REVIEW_MODEL="$CLAUDE_MODEL"
 GH_PAUSE="${GH_PAUSE:-60}"
-SETTLE_SECONDS="${SETTLE_SECONDS:-600}"
+SETTLE_SECONDS="${SETTLE_SECONDS:-300}"
 REVIEW_JOBS="${REVIEW_JOBS:-3}"
+
+# Set to route Codex through an OpenAI-compatible gateway, keyed by CODEX_API_KEY.
+# Claude reads ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN on its own.
+codex_provider=()
+[[ -n ${CODEX_BASE_URL:-} ]] && codex_provider=(
+  -c 'model_provider="gateway"' -c 'model_providers.gateway.name="gateway"'
+  -c "model_providers.gateway.base_url=$(jq -Rn --arg u "$CODEX_BASE_URL" '$u')"
+  -c 'model_providers.gateway.env_key="CODEX_API_KEY"'
+  -c 'model_providers.gateway.wire_api="responses"')
+
+# The model CLIs read untrusted pull requests, so in a container they run with
+# the GitHub login directory masked. The token must live there (GH_CONFIG_DIR),
+# never in the environment, which /proc would show. Proven by verify_isolation.sh.
+if [[ -n ${HIDE_FROM_MODELS:-} ]]; then
+  model_jail=(bwrap --dev-bind / / --tmpfs "$HIDE_FROM_MODELS" --die-with-parent --)
+  claude() { "${model_jail[@]}" claude "$@"; }
+  codex() { "${model_jail[@]}" codex "$@"; }
+fi
+
+# Set to a directory shared with the pr-agent container to add its advisory comment.
+PR_AGENT_JOBS="${PR_AGENT_JOBS:-}"
+PR_AGENT_MODEL="${PR_AGENT_MODEL:-claude-sonnet-5-5}"
+PR_AGENT_TIMEOUT="${PR_AGENT_TIMEOUT:-600}"
 
 # A rate-limited call (primary, secondary, or search) pauses and retries rather
 # than dropping a review. Output is buffered so a retried --paginate never
@@ -66,6 +89,32 @@ resolve_owners() {
 # Every path that drops a pull request logs here, so a skip is never silent.
 log_pr() { # log_pr <action> <repo#number> <detail>
   printf '  %-7s %-44s %s\n' "$1" "$2" "$3" >&2
+  status_event "$@"
+}
+
+# Reviews outlive their tick in history.jsonl; everything else starts afresh.
+start_status_feed() {
+  [[ -n $STATUS_DIR ]] || return 0
+  touch "$STATUS_DIR/events.jsonl" "$STATUS_DIR/history.jsonl" || return 1
+  # Titles are only known while a PR is open, so each outcome line keeps its own.
+  jq -c -s '(map(select(.a == "check") | {(.pr): .d}) | add // {}) as $titles | .[]
+    | select(.a == "done" or .a == "carry" or .a == "FAILED"
+             or (.a == "" and (.d | contains(": running ") | not)))
+    | if .a != "" and $titles[.pr] then .title = $titles[.pr] else . end' \
+    "$STATUS_DIR/events.jsonl" >>"$STATUS_DIR/history.jsonl"
+  tail -n 200 "$STATUS_DIR/history.jsonl" >"$STATUS_DIR/history.tmp" &&
+    mv "$STATUS_DIR/history.tmp" "$STATUS_DIR/history.jsonl" || return 1
+  : >"$STATUS_DIR/events.jsonl" || return 1
+  status_event tick '' "${TICK_SECONDS:-120} $SETTLE_SECONDS"
+}
+
+# The dashboard's feed: this tick's decisions, one JSON object per line.
+STATUS_DIR="${STATUS_DIR:-}"
+TICK_RESULT='scan failed; see the log'
+status_event() { # status_event <action> <repo#number> <detail>
+  [[ -n $STATUS_DIR ]] || return 0
+  jq -cn --arg a "$1" --arg pr "$2" --arg d "$3" '{t: now | floor, a: $a, pr: $pr, d: $d}' \
+    >>"$STATUS_DIR/events.jsonl"
 }
 
 discover_prs() {
@@ -137,6 +186,7 @@ quarantine_instructions() { # quarantine_instructions <dir>
 
 # Leftovers from a run that was killed before its trap fired.
 reap_stale_checkouts() {
+  [[ -n $PR_AGENT_JOBS ]] && rm -rf "$PR_AGENT_JOBS"/job.* 2>/dev/null
   [[ -d $WORK_DIR ]] || return 0
   if [[ $(basename "$WORK_DIR") != pr-reviewer ]]; then
     echo "ERROR: refusing to reap $WORK_DIR (basename must be pr-reviewer)" >&2
@@ -267,6 +317,7 @@ run_codex() { # run_codex <persona> <dir> <prompt-file>
   runtime=$(mktemp -d) || return 1
   codex --no-daemon -a never exec --ignore-user-config --ignore-rules \
     --ephemeral --skip-git-repo-check -C "$runtime" --sandbox read-only \
+    "${codex_provider[@]}" \
     --model "$CODEX_MODEL" -c "model_reasoning_effort=$(jq -Rn --arg e "$REASONING_EFFORT" '$e')" \
     -c "developer_instructions=$(jq -Rn --arg s "$instructions" '$s')" \
     -c project_doc_max_bytes=0 -c 'web_search="disabled"' \
@@ -517,6 +568,46 @@ deliver_full_finding() { # deliver_full_finding <repo> <number> <head> <verdict>
   return 1
 }
 
+# pr-agent gives a second, general opinion that never gates. It runs in its own
+# container with no GitHub token: it is handed a two-commit repository (merge
+# base, then the pull request's tree) and hands back review.md.
+advise_pr_agent() { # advise_pr_agent <repo> <number> <head-sha> <base-sha> <comments-json> <runner>
+  local repo="$1" number="$2" head="$3" base="$4" pc url mb job commit waited=0 rc=1
+  pc=$(jq -c --arg me "$6" 'first(.[] | select(.user.login == $me and
+    (.body | startswith("<!-- pr-reviewer advisory=pr-agent ")))) // empty' <<<"$5")
+  # A reply re-runs the security persona; the advisory only follows new code.
+  [[ $(state_field "$(jq -r '.body // ""' <<<"${pc:-null}")" head) == "$head" ]] && return 0
+  url=$(jq -r '.url // empty' <<<"${pc:-null}")
+  mb=$(gh api "repos/$repo/compare/$base...$head" --jq .merge_base_commit.sha) || return 1
+  job=$(mktemp -d "$PR_AGENT_JOBS/job.XXXXXX") || return 1
+  if git init -q "$job/repo" &&
+    git -C "$job/repo" fetch -q --depth=1 "https://github.com/$repo" "$mb" "$head" &&
+    commit=$(git -C "$job/repo" -c user.name=pr-reviewer -c user.email=pr-reviewer@localhost \
+      commit-tree "$head^{tree}" -p "$mb" -m "PR #$number") &&
+    git -C "$job/repo" branch base "$mb" &&
+    git -C "$job/repo" checkout -q -B pr "$commit" &&
+    touch "$job/ready"; then
+    until [[ -e $job/done || $waited -ge $PR_AGENT_TIMEOUT ]]; do
+      sleep 5
+      waited=$((waited + 5))
+    done
+    if [[ -s $job/review.md ]]; then
+      {
+        printf '<!-- pr-reviewer advisory=pr-agent head=%s -->\n' "$head"
+        cat "$job/review.md"
+        printf '\n\n---\nAdvisory only: this comment never gates the pull request.\n%s\n' \
+          "$(signature "$PR_AGENT_MODEL" pr-agent)"
+      } >"$job/body"
+      upsert_comment "$repo" "$number" "$url" "$job/body" && rc=0
+    else
+      echo "--- pr-agent: no review after ${waited}s ---" >&2
+      [[ -r $job/log ]] && tail -5 "$job/log" >&2
+    fi
+  fi
+  rm -rf "$job"
+  return "$rc"
+}
+
 # Returns 0 reviewed, 1 failed, 2 up to date, 3 settling, and with "check"
 # 4 needs a review (the check makes no model call).
 review_pr() { # review_pr <repo> <number> <runner-login> [check]
@@ -525,7 +616,7 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
   [[ $REVIEW_BACKEND == claude ]] && REVIEW_MODEL="$CLAUDE_MODEL"
   local head_sha comments threads reviews replies newest dir persona pc body_text
   local prior url out verdict body stripped report_ref cleared=0 lines="" truncated="" rc=0 repo_json
-  local t0 meta updated age fp base_sha
+  local t0 meta updated age fp base_sha advisory=""
   local summary_signatures=""
   # Fixed once: background reviews share $$, and $BASHPID changes inside $(...).
   local tag=$BASHPID
@@ -580,6 +671,10 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
   if [[ ${#pending[@]} -eq 0 ]]; then
     [[ -n ${VERBOSE:-} ]] && log_pr skip "$repo#$number" \
       "up to date — head ${head_sha:0:8} already reviewed, no reply since ${newest:-none}"
+    for persona in "${PERSONA_ORDER[@]}"; do
+      status_event current "$repo#$number" \
+        "$persona: ${VERDICTS[$persona]:-not yet reviewed} at ${head_sha:0:8}"
+    done
     return 2
   fi
 
@@ -607,6 +702,7 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
     upsert_comment "$repo" "$number" "${URL[$persona]}" "$out" || rc=1
     rm -f "$out"
     log_pr carry "$repo#$number" "$persona: changed files unchanged at ${head_sha:0:8}; review carried forward"
+    status_event current "$repo#$number" "$persona: ${VERDICTS[$persona]:-not yet reviewed} at ${head_sha:0:8}"
   done
   if [[ ${#kept[@]} -eq 0 ]]; then
     [[ $rc -eq 0 ]] && return 2
@@ -631,6 +727,20 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
   head -c "$MAX_DIFF_BYTES" "$WORK_DIR/diff.full.$tag" >"$WORK_DIR/diff.$tag" || return 1
   [[ $(wc -c <"$WORK_DIR/diff.full.$tag") -gt $MAX_DIFF_BYTES ]] &&
     truncated=$'\n\n> Review input was truncated; omitted changes were not reviewed.'
+
+  # pr-agent runs beside the personas so its advice lands with the verdict.
+  # Public repositories are opt-in: its comment is published unredacted.
+  if [[ -n $PR_AGENT_JOBS && ( $IS_PUBLIC == 0 || -n ${PR_AGENT_PUBLIC:-} ) ]]; then
+    (
+      t0=$SECONDS
+      if advise_pr_agent "$repo" "$number" "$head_sha" "$base_sha" "$comments" "$runner"; then
+        log_pr '' "$repo#$number" "pr-agent: advisory current after $((SECONDS - t0))s"
+      else
+        log_pr '' "$repo#$number" 'pr-agent: advisory failed (not a gate)'
+      fi
+    ) &
+    advisory=$!
+  fi
 
   for persona in "${pending[@]}"; do
     pc=$(persona_comment "$comments" "$persona" "$runner")
@@ -693,6 +803,8 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
   printf '\n---\n%s\n' "${summary_signatures:-$(signature "$REVIEW_MODEL" pr-reviewer)}" >>"$WORK_DIR/body.$tag"
   upsert_comment "$repo" "$number" "$url" "$WORK_DIR/body.$tag" || rc=1
 
+  [[ -n $advisory ]] && wait "$advisory"
+
   log_pr 'done' "$repo#$number" "$cleared/${#PERSONA_ORDER[@]} personas cleared"
   return $rc
 }
@@ -743,6 +855,8 @@ main() {
   # failure would silently loop zero times and exit 0 instead of failing loudly.
   local prs
   echo "pr-reviewer · scanning · backend $REVIEW_BACKEND" >&2
+  start_status_feed || exit 1
+  [[ -n $STATUS_DIR ]] && trap 'status_event end "" "$TICK_RESULT"' EXIT
   prs=$(discover_prs) || { echo "ERROR: discovery failed" >&2; exit 1; }
   review_queue "$runner" "$prs" || exit 1
 }
@@ -793,6 +907,7 @@ review_queue() { # review_queue <runner-login> <tsv-of-prs>
 
   [[ ${n[current]} -gt 0 && -z ${VERBOSE:-} ]] && hint=" (VERBOSE=1 to list)"
   [[ ${n[settling]} -gt 0 ]] && settling=" · ${n[settling]} settling"
+  TICK_RESULT="${n[reviewed]} reviewed · ${n[current]} up to date$settling · ${n[deferred]} deferred · ${n[failed]} failed"
   printf '\npr-reviewer · %s reviewed · %s up to date%s%s · %s deferred · %s failed\n' \
     "${n[reviewed]}" "${n[current]}" "$hint" "$settling" "${n[deferred]}" "${n[failed]}" >&2
 
