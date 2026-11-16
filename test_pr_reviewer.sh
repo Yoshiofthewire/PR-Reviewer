@@ -903,7 +903,9 @@ case "$1 $2" in
   # list, already in the TSV shape change_fingerprint's --jq produces.
   api\ repos/*/compare/*)
     case "$*" in
-      *vnd.github.diff*) printf 'diff --git a/x b/x\n%s+added line\n' "${STUB_DIFF_MODE:-}" ;;
+      *vnd.github.diff*)
+        if [[ -n ${STUB_DIFF_FILE:-} ]]; then cat "$STUB_DIFF_FILE"
+        else printf 'diff --git a/x b/x\n%s+added line\n' "${STUB_DIFF_MODE:-}"; fi ;;
       *) cat "${STUB_FILES_FILE:-/dev/null}" ;;
     esac ;;
   "api --method")
@@ -1071,6 +1073,80 @@ STUB_UPDATED=$(jq -rn 'now - 60 | todate') rc "a PR changed a minute ago is sett
 STUB_UPDATED=$(jq -rn 'now - 60 | todate') SETTLE_SECONDS=30 rc "a PR quiet past the window is reviewed" 0 \
   review_pr yoshi/alpha 1 yoshi
 STUB_UPDATED=not-a-date rc "an unreadable updatedAt does not block a review" 0 review_pr yoshi/alpha 1 yoshi
+
+# --- review_pr: source over the budget is reviewed in extra passes, never assumed ---
+cp "$STUB/bin/claude" "$STUB/claude.saved"
+cat >"$STUB/bin/claude" <<'STUBEOF'
+#!/usr/bin/env bash
+echo "$*" >>"$STUB_CLAUDE_LOG"
+cat >>"$STUB_CLAUDE_LOG"
+printf 'No findings.\nVERDICT: CLEARED\n'
+STUBEOF
+chmod +x "$STUB/bin/claude"
+over_file() { printf 'diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -0,0 +1 @@\n+%s\n' "$1" "$1" "$1" "$1" "$(head -c "$2" /dev/zero | tr '\0' x)"; }
+over_file src/keep.go 50 >"$STUB/over.diff"
+printf 'diff --git a/src/auth.go b/src/auth.go\ndeleted file mode 100644\n--- a/src/auth.go\n+++ /dev/null\n@@ -1 +0,0 @@\n-%s\n' \
+  "$(head -c 400 /dev/zero | tr '\0' z)" >>"$STUB/over.diff"
+over_file web/dist/b.js 300 >>"$STUB/over.diff"
+export STUB_REPO_JSON='{"isPrivate":true}' STUB_COMMENTS_FILE="$STUB/comments-empty.json" STUB_HEAD_SHA=bigsha
+: >"$STUB_CLAUDE_LOG"
+export STUB_DIFF_FILE="$STUB/over.diff" DRY_RUN=1
+SAVED_BACKEND=$REVIEW_BACKEND SAVED_DRY=${DRY_RUN-} SAVED_HEAD=$STUB_HEAD_SHA SAVED_COMMENTS=$STUB_COMMENTS_FILE SAVED_REPO=$STUB_REPO_JSON SAVED_MAX=$MAX_DIFF_BYTES SAVED_PASSES=$MAX_REVIEW_PASSES
+REVIEW_BACKEND=claude MAX_DIFF_BYTES=600 MAX_REVIEW_PASSES=5
+OVER_OUT=$(review_pr yoshi/alpha 9 yoshi 2>/dev/null)
+eq "an oversized source file gets its own pass" 2 "$(grep -c '^Invoke the security-audit' "$STUB_CLAUDE_LOG")"
+contains "the second pass is labelled" "$(cat "$STUB_CLAUDE_LOG")" 'Diff, pass 2 of 2'
+contains "every extra pass lists the changed files" "$(cat "$STUB_CLAUDE_LOG")" 'a/src/auth.go b/src/auth.go'
+contains "a deleted file's patch reaches the reviewer" "$(cat "$STUB_CLAUDE_LOG")" '+++ /dev/null'
+contains "its removed lines reach the reviewer" "$(cat "$STUB_CLAUDE_LOG")" '-zzzz'
+contains "every pass cleared, so the review clears" "$OVER_OUT" 'verdict=cleared'
+contains "the note says how the source was reviewed" "$OVER_OUT" 'reviewed from its full patch in 1 extra pass(es): `src/auth.go`'
+MAX_DIFF_BYTES=300
+: >"$STUB_CLAUDE_LOG"
+SPLIT_OUT=$(review_pr yoshi/alpha 9 yoshi 2>/dev/null)
+contains "a bundle left out is listed as not reviewed" "$SPLIT_OUT" 'Generated, not reviewed (CI must rebuild them from source and compare): `web/dist/b.js`'
+eq "a line longer than the budget travels whole in one extra pass" 2 "$(grep -c '^Invoke the security-audit' "$STUB_CLAUDE_LOG")"
+contains "the oversized line keeps its file header" "$(cat "$STUB_CLAUDE_LOG")" $'deleted file mode 100644\n--- a/src/auth.go\n+++ /dev/null\n@@ -1 +0,0 @@\n-zzzz'
+MAX_DIFF_BYTES=600
+
+: >"$STUB_CLAUDE_LOG"
+MAX_REVIEW_PASSES=0
+CAP_OUT=$(review_pr yoshi/alpha 9 yoshi 2>/dev/null)
+eq "past the pass cap no extra pass runs" 1 "$(grep -c '^Invoke the security-audit' "$STUB_CLAUDE_LOG")"
+contains "unread source blocks clearance" "$CAP_OUT" 'verdict=open'
+contains "the note says the source was not reviewed" "$CAP_OUT" 'Source, NOT reviewed'
+MAX_REVIEW_PASSES=5
+eval "real_$(declare -f split_overflow)"
+eval 'split_overflow() { cat >/dev/null; }'
+LOST_OUT=$(review_pr yoshi/alpha 9 yoshi 2>/dev/null)
+contains "a left-out file that reaches no pass blocks clearance" "$LOST_OUT" 'verdict=open'
+contains "and it is reported as not reviewed" "$LOST_OUT" 'Source, NOT reviewed'
+eval "$(declare -f real_split_overflow | sed '1s/real_//')"
+REVIEW_BACKEND=$SAVED_BACKEND MAX_DIFF_BYTES=$SAVED_MAX MAX_REVIEW_PASSES=$SAVED_PASSES DRY_RUN=$SAVED_DRY
+export STUB_HEAD_SHA=$SAVED_HEAD STUB_COMMENTS_FILE=$SAVED_COMMENTS STUB_REPO_JSON=$SAVED_REPO
+mv "$STUB/claude.saved" "$STUB/bin/claude"
+unset STUB_DIFF_FILE
+
+# --- split_overflow: parts break between files and hunks, never without headers ---
+SPLIT_DIR=$(mktemp -d)
+{ printf 'diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n'
+  for h in 1 2 3; do printf '@@ -%s,1 +%s,1 @@ func f%s\n' "$h" "$h" "$h"; for l in 1 2 3 4 5; do printf '+line %s of hunk %s xxxxxxxxxxxxxxxxxxxx\n' "$l" "$h"; done; done
+  printf 'diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1 @@\n+small\n'; } >"$SPLIT_DIR/in"
+split_overflow 260 "$SPLIT_DIR" t <"$SPLIT_DIR/in"
+SPLIT_BAD=0
+for part in "$SPLIT_DIR"/part*.t; do
+  [[ $(head -1 "$part") == 'diff --git a/a.go b/a.go' ]] || SPLIT_BAD=1
+  [[ $(sed -n 4p "$part") == @@* ]] || SPLIT_BAD=1
+done
+eq "every part opens with its file header and hunk header" 0 "$SPLIT_BAD"
+eq "no changed line is lost or repeated across parts" 16 "$(cat "$SPLIT_DIR"/part*.t | grep -c '^+line\|^+small')"
+eq "a line is never split" 0 "$(cat "$SPLIT_DIR"/part*.t | grep -c '^x')"
+contains "a small file rides along whole" "$(cat "$SPLIT_DIR"/part*.t)" $'diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1 @@\n+small'
+LONGNAME="src/$(head -c 300 /dev/zero | tr '\0' n).go"
+printf 'diff --git a/%s b/%s.go\nsimilarity index 100%%\nrename from %s\nrename to %s.go\n' "$LONGNAME" "$LONGNAME" "$LONGNAME" "$LONGNAME" >"$SPLIT_DIR/rename"
+split_overflow 200 "$SPLIT_DIR" r <"$SPLIT_DIR/rename"
+eq "a change with no hunks over the budget still reaches a pass" "$(cat "$SPLIT_DIR/rename")" "$(cat "$SPLIT_DIR"/part*.r 2>/dev/null)"
+rm -rf "$SPLIT_DIR"
 
 # pr-agent runs beside the security review, and the review waits for it.
 eval "real_$(declare -f run_persona)"
@@ -1400,6 +1476,64 @@ eq "a finished review keeps its title" 'a "quoted" <b>title</b>' "$(jq -r 'selec
 STATUS_DIR=""
 log_pr check 'yoshi/alpha#8' 'unrecorded' 2>/dev/null
 eq "no STATUS_DIR, no feed" 1 "$(lines_of "$(cat "$STUB/status/events.jsonl")")"
+
+# --- fit_diff: source first, generated bundles dropped first, whole files only ---
+GEN='(^|/)dist/.*[.](js|css|html|map)$|[.]min[.](js|css)$|[.]map$'
+mkdiff() { # mkdiff <path> <payload-bytes>
+  printf 'diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -0,0 +1 @@\n+%s\n' "$1" "$1" "$1" "$1" "$(head -c "$2" /dev/zero | tr '\0' x)"
+}
+FD=$(mkdiff web/dist/index-abc.js 400; mkdiff web/src/App.tsx 100; mkdiff app.min.js 50; mkdiff internal/api/server.go 100)
+eq "a diff that fits keeps every file" 4 "$(fit_diff 100000 "$GEN" diff <<<"$FD" | grep -c '^diff --git')"
+eq "a diff that fits keeps every byte" "$(wc -c <<<"$FD")" "$(fit_diff 100000 "$GEN" diff <<<"$FD" | wc -c)"
+eq "a diff that fits omits nothing" '' "$(fit_diff 100000 "$GEN" omitted <<<"$FD")"
+# Sections: dist 531, App.tsx 207, app.min.js 137, server.go 235 bytes.
+FIT=$(fit_diff 600 "$GEN" diff <<<"$FD")
+contains "source survives a tight budget" "$FIT" 'diff --git a/web/src/App.tsx'
+contains "later source still survives" "$FIT" 'diff --git a/internal/api/server.go'
+lacks "the big bundle is dropped" "$FIT" 'web/dist/index-abc.js'
+eq "source keeps diff order ahead of generated" 'web/src/App.tsx internal/api/server.go app.min.js' \
+  "$(grep -o '^diff --git a/[^ ]*' <<<"$FIT" | sed 's|diff --git a/||' | paste -sd' ')"
+eq "omitted lists the dropped bundle as generated" $'generated\tweb/dist/index-abc.js' "$(fit_diff 600 "$GEN" omitted <<<"$FD")"
+eq "an oversized source file is listed as source" $'source\tweb/src/App.tsx\nsource\tinternal/api/server.go\ngenerated\tweb/dist/index-abc.js\ngenerated\tapp.min.js' \
+  "$(fit_diff 100 "$GEN" omitted <<<"$FD")"
+lacks "no file is cut mid-hunk" "$(fit_diff 300 "$GEN" diff <<<"$FD")" 'web/dist'
+eq "spaces in a path survive" $'generated\tdist/a b.js' "$(fit_diff 10 "$GEN" omitted <<<"$(mkdiff 'dist/a b.js' 50)")"
+eq "an empty generated pattern keeps plain diff order" $'source\tweb/src/App.tsx\nsource\tapp.min.js\nsource\tinternal/api/server.go' \
+  "$(fit_diff 600 '' omitted <<<"$FD")"
+
+QD=$(mkdiff web/dist/big.js 400; printf 'diff --git "a/src/evil\\tname.go" "b/src/evil\\tname.go"\n--- "a/src/evil\\tname.go"\n+++ "b/src/evil\\tname.go"\n@@ -0,0 +1 @@\n+%s\n' "$(head -c 300 /dev/zero | tr '\0' y)")
+eq "a quoted path starts its own section as source" $'source\t"a/src/evil\\tname.go" "b/src/evil\\tname.go"\ngenerated\tweb/dist/big.js' \
+  "$(fit_diff 100 "$GEN" omitted <<<"$QD")"
+contains "a quoted source file is kept ahead of a bundle" "$(fit_diff 500 "$GEN" diff <<<"$QD")" 'evil\tname.go'
+eq "a name hiding \" b/\" is not split into a bundle" $'source\tdist/a.js b/evil.go' \
+  "$(fit_diff 10 "$GEN" omitted <<<"$(mkdiff 'dist/a.js b/evil.go' 50)")"
+eq "a rename is never generated" $'source\ta/src/x.go b/web/dist/x.js' \
+  "$(fit_diff 10 "$GEN" omitted <<<$'diff --git a/src/x.go b/web/dist/x.js\nsimilarity index 90%\n')"
+eq "a bundle renamed by its hash is generated" $'generated\tweb/dist/b-2.js' \
+  "$(fit_diff 10 "$GEN" omitted <<<$'diff --git a/web/dist/b-1.js b/web/dist/b-2.js\nsimilarity index 90%\nrename from web/dist/b-1.js\nrename to web/dist/b-2.js\n')"
+eq "a rename out of source is never generated" $'source\ta/src/x.go b/web/dist/x.js' \
+  "$(fit_diff 10 "$GEN" omitted <<<$'diff --git a/src/x.go b/web/dist/x.js\nsimilarity index 90%\nrename from src/x.go\nrename to web/dist/x.js\n')"
+eq "rename lines inside a hunk are content, not metadata" $'source\ta/src/x.go b/src/y.go' \
+  "$(fit_diff 10 "$GEN" omitted <<<$'diff --git a/src/x.go b/src/y.go\n@@ -1 +1 @@\nrename from dist/a.js\nrename to dist/b.js\n')"
+eq "code under dist/ is still source" $'source\tdist/x.go' "$(fit_diff 10 "$GEN" omitted <<<"$(mkdiff dist/x.go 50)")"
+lacks "a backtick in a name cannot close the code span" "$(omission_note $'source\tsrc/a`b.go' L)" 'a`b'
+contains "the name survives without its backtick" "$(omission_note $'source\tsrc/a`b.go' L)" '`src/ab.go`'
+DELD=$(mkdiff src/keep.go 50; printf 'diff --git a/src/auth.go b/src/auth.go\ndeleted file mode 100644\n--- a/src/auth.go\n+++ /dev/null\n@@ -1 +0,0 @@\n-%s\n' "$(head -c 400 /dev/zero | tr '\0' z)"; mkdiff web/dist/b.js 300)
+OVER=$(fit_diff 300 "$GEN" overflow <<<"$DELD")
+contains "overflow carries a deleted source file's patch" "$OVER" '+++ /dev/null'
+contains "overflow carries the removed lines" "$OVER" '-zzzz'
+lacks "overflow never carries generated bundles" "$OVER" 'web/dist/b.js'
+lacks "overflow leaves out files that fit" "$OVER" 'src/keep.go'
+
+eq "nothing omitted, no note" '' "$(omission_note '' L)"
+NOTE=$(omission_note "$(fit_diff 100 "$GEN" omitted <<<"$FD")" 'Source, reviewed in extra passes')
+contains "the note still says truncated" "$NOTE" 'Review input was truncated'
+contains "the note counts files" "$NOTE" 'changes to 4 file(s)'
+contains "source carries the caller's label" "$NOTE" 'Source, reviewed in extra passes: `web/src/App.tsx`, `internal/api/server.go`'
+contains "generated is named as not reviewed" "$NOTE" 'Generated, not reviewed (CI must rebuild them from source and compare): `web/dist/index-abc.js`, `app.min.js`'
+MANY=$(for i in $(seq 1 25); do printf 'generated\tdist/f%s.js\n' "$i"; done)
+contains "long lists are capped" "$(omission_note "$MANY" L)" ', and 5 more'
+lacks "the cap hides the 21st name" "$(omission_note "$MANY" L)" 'dist/f21.js'
 
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"

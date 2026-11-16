@@ -23,6 +23,10 @@ source "$SCRIPT_DIR/lib/review-core.sh"
 
 MAX_PRS_PER_TICK="${MAX_PRS_PER_TICK:-5}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-180000}"
+# Built output the size budget drops first. Brackets, not backslashes: awk -v eats escapes.
+# Extra passes for source that does not fit; past this the review cannot clear.
+MAX_REVIEW_PASSES="${MAX_REVIEW_PASSES:-5}"
+GENERATED_PATHS="${GENERATED_PATHS:-(^|/)dist/.*[.](js|css|html|map)$|[.]min[.](js|css)$|[.]map$}"
 REVIEW_BACKEND="${REVIEW_BACKEND:-codex}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-6.1-sol}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-claude-opus-5-5}"
@@ -610,12 +614,58 @@ advise_pr_agent() { # advise_pr_agent <repo> <number> <head-sha> <base-sha> <com
 
 # Returns 0 reviewed, 1 failed, 2 up to date, 3 settling, and with "check"
 # 4 needs a review (the check makes no model call).
+# Write fit_diff overflow (stdin) to <dir>/part<N>.<tag>, each within <max> bytes
+# where it can be. Parts break only between files; a file larger than <max>
+# breaks between hunks with its file header repeated, and a hunk larger than
+# <max> breaks between lines with both headers repeated, so no pass sees a change
+# without the file and hunk it belongs to.
+split_overflow() { # split_overflow <max-bytes> <dir> <tag>
+  LC_ALL=C awk -v max="$1" -v dir="$2" -v tag="$3" '
+    function emit(text) { # starts a new part when text does not fit the current one
+      if (used && used + length(text) > max) { close(f); n++; used = 0 }
+      f = dir "/part" n "." tag; printf "%s", text > f; used += length(text)
+    }
+    function flush(   whole, cur, k, m, q, hl, hh, chunk) {
+      if (head == "") return
+      whole = head
+      for (k = 1; k <= nh; k++) whole = whole hunk[k]
+      # Small files, and changes with no hunks (renames, mode changes), go whole.
+      if (length(whole) <= max || nh == 0) { emit(whole); head = ""; nh = 0; return }
+      cur = head
+      for (k = 1; k <= nh; k++) {
+        if (length(head) + length(hunk[k]) <= max) {
+          if (length(cur) + length(hunk[k]) > max) { emit(cur); cur = head }
+          cur = cur hunk[k]
+          continue
+        }
+        # A hunk larger than the budget: line by line under both headers.
+        if (cur != head) { emit(cur); cur = head }
+        m = split(hunk[k], hl, "\n"); hh = hl[1] "\n"; chunk = head hh
+        for (q = 2; q < m; q++) {
+          if (length(chunk) + length(hl[q]) + 1 > max && chunk != head hh) { emit(chunk); chunk = head hh }
+          chunk = chunk hl[q] "\n"
+        }
+        emit(chunk)
+      }
+      if (cur != head) emit(cur)
+      head = ""; nh = 0
+    }
+    BEGIN { n = 1 }
+    /^diff --git / { flush(); head = $0 "\n"; inhead = 1; next }
+    inhead && /^@@/ { inhead = 0 }
+    inhead { head = head $0 "\n"; next }
+    /^@@/ { hunk[++nh] = $0 "\n"; next }
+    { hunk[nh] = hunk[nh] $0 "\n" }
+    END { flush() }'
+}
+
 review_pr() { # review_pr <repo> <number> <runner-login> [check]
   local repo="$1" number="$2" runner="$3" mode="${4:-}"
   local REVIEW_MODEL="$CODEX_MODEL"
   [[ $REVIEW_BACKEND == claude ]] && REVIEW_MODEL="$CLAUDE_MODEL"
   local head_sha comments threads reviews replies newest dir persona pc body_text
-  local prior url out verdict body stripped report_ref cleared=0 lines="" truncated="" rc=0 repo_json
+  local -a parts
+  local prior url out verdict body stripped report_ref cleared=0 lines="" truncated="" omitted omitted_source="" incomplete="" extra i k passed changed rc=0 repo_json
   local t0 meta updated age fp base_sha advisory=""
   local summary_signatures=""
   # Fixed once: background reviews share $$, and $BASHPID changes inside $(...).
@@ -724,9 +774,36 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
   # Scratch files live beside the checkout, never inside it.
   gh api "repos/$repo/compare/$base_sha...$head_sha" -H 'Accept: application/vnd.github.diff' \
     >"$WORK_DIR/diff.full.$tag" || return 1
-  head -c "$MAX_DIFF_BYTES" "$WORK_DIR/diff.full.$tag" >"$WORK_DIR/diff.$tag" || return 1
-  [[ $(wc -c <"$WORK_DIR/diff.full.$tag") -gt $MAX_DIFF_BYTES ]] &&
-    truncated=$'\n\n> Review input was truncated; omitted changes were not reviewed.'
+  fit_diff "$MAX_DIFF_BYTES" "$GENERATED_PATHS" diff <"$WORK_DIR/diff.full.$tag" \
+    >"$WORK_DIR/diff.$tag" || return 1
+  omitted=$(fit_diff "$MAX_DIFF_BYTES" "$GENERATED_PATHS" omitted <"$WORK_DIR/diff.full.$tag") ||
+    return 1
+  omitted_source=$(awk -F'\t' '$1 == "source" { print $2 }' <<<"$omitted")
+  # Source that did not fit is reviewed from its own patches in further passes,
+  # each within the budget, so deletions and removed lines are seen too.
+  parts=("$WORK_DIR/diff.$tag")
+  incomplete=""
+  changed=$(grep '^diff --git ' "$WORK_DIR/diff.full.$tag" | cut -c12-)
+  if [[ -n $omitted_source ]]; then
+    fit_diff "$MAX_DIFF_BYTES" "$GENERATED_PATHS" overflow <"$WORK_DIR/diff.full.$tag" |
+      split_overflow "$MAX_DIFF_BYTES" "$WORK_DIR" "$tag" || return 1
+    # Named *.$tag so the RETURN trap that clears this review's scratch removes them.
+    extra=$(find "$WORK_DIR" -maxdepth 1 -name "part*.$tag" | wc -l)
+    # Every left-out source file must reach a pass, or the review cannot clear.
+    if [[ -n $(fit_diff "$MAX_DIFF_BYTES" "$GENERATED_PATHS" overflow <"$WORK_DIR/diff.full.$tag" |
+      grep '^diff --git ' | grep -vxF -f <(cat "$WORK_DIR"/part*."$tag" 2>/dev/null | grep '^diff --git ')) ]]; then
+      incomplete=1
+    elif [[ $extra -le $MAX_REVIEW_PASSES ]]; then
+      for ((i = 1; i <= extra; i++)); do parts+=("$WORK_DIR/part$i.$tag"); done
+    else
+      incomplete=1
+    fi
+  fi
+  if [[ -n $incomplete ]]; then
+    truncated=$(omission_note "$omitted" "Source, NOT reviewed: it does not fit in MAX_REVIEW_PASSES ($MAX_REVIEW_PASSES) extra passes, so this review cannot clear; split the pull request")
+  else
+    truncated=$(omission_note "$omitted" "Source, reviewed from its full patch in $((${#parts[@]} - 1)) extra pass(es)")
+  fi
 
   # pr-agent runs beside the personas so its advice lands with the verdict.
   # Public repositories are opt-in: its comment is published unredacted.
@@ -746,38 +823,47 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
     pc=$(persona_comment "$comments" "$persona" "$runner")
     prior=$(jq -r '.body // ""' <<<"${pc:-null}")
     url=$(jq -r '.url // empty' <<<"${pc:-null}")
-    {
-      build_persona_task "$persona" "$prior" \
-        "$(reply_bodies "$replies" "$(state_field "$prior" seen)" "$runner")"
-      printf '\nDiff (possibly truncated):\n'
-      cat "$WORK_DIR/diff.$tag"
-    } >"$WORK_DIR/prompt.$tag"
-
-    # Each persona is a multi-minute model call. Announce it before blocking, or
-    # the tick looks hung; report the elapsed time after, so slow ones are visible.
+    # Each persona is a multi-minute model call per pass. Announce it before
+    # blocking, or the tick looks hung; report the elapsed time after.
     t0=$SECONDS
     log_pr '' "$repo#$number" \
-      "$persona: running ${PERSONA_SKILL[$persona]} ($REVIEW_BACKEND/$REASONING_EFFORT)…"
-    # A failed run must not inherit the verdict seeded from the old comment: the
-    # summary would otherwise report it at the new head as if this head was reviewed.
-    run_persona "$persona" "$dir" "$WORK_DIR/prompt.$tag" >"$WORK_DIR/output.$tag" || {
+      "$persona: running ${PERSONA_SKILL[$persona]} ($REVIEW_BACKEND/$REASONING_EFFORT, ${#parts[@]} pass(es))…"
+    verdict=cleared stripped="" passed=1
+    for ((k = 0; k < ${#parts[@]}; k++)); do
+      {
+        build_persona_task "$persona" "$prior" \
+          "$(reply_bodies "$replies" "$(state_field "$prior" seen)" "$runner")"
+        if [[ ${#parts[@]} -eq 1 ]]; then
+          printf '\nDiff:\n'
+        elif [[ $k -eq 0 ]]; then
+          printf '\nDiff, pass 1 of %s: every change that fits. Source changes that did not fit are reviewed in the other passes.\n' "${#parts[@]}"
+        else
+          printf '\nEvery file this pull request changes, for context (read them in the checkout as needed):\n%s\n' "$changed"
+          printf '\nDiff, pass %s of %s: only source changes that did not fit in pass 1. A file too large for one pass continues in the next, with its header repeated. The rest of the pull request is reviewed separately.\n' \
+            "$((k + 1))" "${#parts[@]}"
+        fi
+        cat "${parts[$k]}"
+      } >"$WORK_DIR/prompt.$tag"
+      # A failed pass must not inherit the verdict seeded from the old comment: the
+      # summary would otherwise report it at the new head as if this head was reviewed.
+      run_persona "$persona" "$dir" "$WORK_DIR/prompt.$tag" >"$WORK_DIR/output.$tag" || { passed=""; break; }
+      out=$(cat "$WORK_DIR/output.$tag")
+      [[ -n $out ]] || { passed=""; break; }
+      [[ $(parse_verdict "$out") == cleared ]] || verdict=open
+      [[ ${#parts[@]} -gt 1 ]] && stripped+=$'\n'"#### Pass $((k + 1)) of ${#parts[@]}"$'\n\n'
+      stripped+="$(strip_verdict "$out")"$'\n'
+    done
+    if [[ -z $passed ]]; then
       log_pr '' "$repo#$number" "$persona: FAILED after $((SECONDS - t0))s"
       VERDICTS[$persona]=failed
       rc=1
       continue
-    }
-    out=$(cat "$WORK_DIR/output.$tag")
-    [[ -n $out ]] || {
-      log_pr '' "$repo#$number" "$persona: empty output after $((SECONDS - t0))s"
-      VERDICTS[$persona]=failed
-      rc=1
-      continue
-    }
-    verdict=$(parse_verdict "$out")
+    fi
+    # Source left unreviewed means the change was not fully seen.
+    [[ -n $incomplete ]] && verdict=open
     log_pr '' "$repo#$number" "$persona: $verdict after $((SECONDS - t0))s"
     VERDICTS[$persona]=$verdict
     summary_signatures+="$(signature "$REVIEW_MODEL" "${PERSONA_SKILL[$persona]}")"$'\n'
-    stripped=$(strip_verdict "$out")
     if [[ $persona == security && $IS_PUBLIC == 1 ]]; then
       report_ref=$(deliver_full_finding "$repo" "$number" "$head_sha" "$verdict" "$stripped") ||
         rc=1
