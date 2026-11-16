@@ -1402,7 +1402,7 @@ log_pr check 'yoshi/alpha#8' 'unrecorded' 2>/dev/null
 eq "no STATUS_DIR, no feed" 1 "$(lines_of "$(cat "$STUB/status/events.jsonl")")"
 
 # --- fit_diff: source first, generated bundles dropped first, whole files only ---
-GEN='(^|/)dist/|[.]min[.](js|css)$|[.]map$'
+GEN='(^|/)dist/.*[.](js|css|html|map)$|[.]min[.](js|css)$|[.]map$'
 mkdiff() { # mkdiff <path> <payload-bytes>
   printf 'diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -0,0 +1 @@\n+%s\n' "$1" "$1" "$1" "$1" "$(head -c "$2" /dev/zero | tr '\0' x)"
 }
@@ -1425,6 +1425,13 @@ eq "spaces in a path survive" $'generated\tdist/a b.js' "$(fit_diff 10 "$GEN" om
 eq "an empty generated pattern keeps plain diff order" $'source\tweb/src/App.tsx\nsource\tapp.min.js\nsource\tinternal/api/server.go' \
   "$(fit_diff 600 '' omitted <<<"$FD")"
 
+QD=$(mkdiff web/dist/big.js 400; printf 'diff --git "a/src/evil\\tname.go" "b/src/evil\\tname.go"\n--- "a/src/evil\\tname.go"\n+++ "b/src/evil\\tname.go"\n@@ -0,0 +1 @@\n+%s\n' "$(head -c 300 /dev/zero | tr '\0' y)")
+eq "a quoted path starts its own section as source" $'source\t"a/src/evil\\tname.go" "b/src/evil\\tname.go"\ngenerated\tweb/dist/big.js' \
+  "$(fit_diff 100 "$GEN" omitted <<<"$QD")"
+contains "a quoted source file is kept ahead of a bundle" "$(fit_diff 500 "$GEN" diff <<<"$QD")" 'evil\tname.go'
+eq "code under dist/ is still source" $'source\tdist/x.go' "$(fit_diff 10 "$GEN" omitted <<<"$(mkdiff dist/x.go 50)")"
+lacks "a backtick in a name cannot close the code span" "$(omission_note $'source\tsrc/a`b.go')" 'a`b'
+contains "the name survives without its backtick" "$(omission_note $'source\tsrc/a`b.go')" '`src/ab.go`'
 eq "nothing omitted, no note" '' "$(omission_note '')"
 NOTE=$(omission_note "$(fit_diff 100 "$GEN" omitted <<<"$FD")")
 contains "the note still says truncated" "$NOTE" 'Review input was truncated'

@@ -24,7 +24,7 @@ source "$SCRIPT_DIR/lib/review-core.sh"
 MAX_PRS_PER_TICK="${MAX_PRS_PER_TICK:-5}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-180000}"
 # Built output the size budget drops first. Brackets, not backslashes: awk -v eats escapes.
-GENERATED_PATHS="${GENERATED_PATHS:-(^|/)dist/|[.]min[.](js|css)$|[.]map$}"
+GENERATED_PATHS="${GENERATED_PATHS:-(^|/)dist/.*[.](js|css|html|map)$|[.]min[.](js|css)$|[.]map$}"
 REVIEW_BACKEND="${REVIEW_BACKEND:-codex}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-6.1-sol}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-claude-opus-5-5}"

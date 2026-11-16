@@ -157,11 +157,15 @@ repo_filter_reason() { # repo_filter_reason <repo>
 # prints "<source|generated>\t<path>" for each file left out.
 fit_diff() { # fit_diff <max-bytes> <generated-regex> <diff|omitted>
   LC_ALL=C awk -v max="$1" -v gen="$2" -v mode="$3" '
-    /^diff --git a\// {
+    /^diff --git / {
       if (n) body[n] = cur
       n++; cur = $0 "\n"
-      p = $0; sub(/^diff --git a\//, "", p); sub(/ b\/.*$/, "", p)
-      path[n] = p; isgen[n] = (gen != "" && p ~ gen)
+      p = substr($0, 12)
+      # Git quotes unusual names ("a/..."). Keep them whole and never call them
+      # generated, so a crafted name cannot ride out of review on a bundle.
+      quoted = (substr(p, 1, 1) == "\"")
+      if (!quoted) { sub(/^a\//, "", p); sub(/ b\/.*$/, "", p) }
+      path[n] = p; isgen[n] = (!quoted && gen != "" && p ~ gen)
       next
     }
     { if (n) cur = cur $0 "\n"; else pre = pre $0 "\n" }
@@ -184,7 +188,8 @@ omission_note() { # omission_note <fit_diff omitted output>
   printf '\n\n> Review input was truncated to stay under the size limit; changes to %s file(s) were left out of the diff.' \
     "$(grep -c '' <<<"$1")"
   for kind in source generated; do
-    names=$(awk -F'\t' -v k="$kind" '$1 == k { if (c++ < 20) printf "%s`%s`", (c > 1 ? ", " : ""), $2 }
+    # File names come from the PR author: strip backticks so none closes the code span.
+    names=$(awk -F'\t' -v k="$kind" '$1 == k { n = $2; gsub(/`/, "", n); if (c++ < 20) printf "%s`%s`", (c > 1 ? ", " : ""), n }
       END { if (c > 20) printf ", and %d more", c - 20 }' <<<"$1")
     [[ -n $names ]] || continue
     if [[ $kind == source ]]; then
