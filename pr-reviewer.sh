@@ -614,13 +614,57 @@ advise_pr_agent() { # advise_pr_agent <repo> <number> <head-sha> <base-sha> <com
 
 # Returns 0 reviewed, 1 failed, 2 up to date, 3 settling, and with "check"
 # 4 needs a review (the check makes no model call).
+# Write fit_diff overflow (stdin) to <dir>/part<N>.<tag>, each within <max> bytes
+# where it can be. Parts break only between files; a file larger than <max>
+# breaks between hunks with its file header repeated, and a hunk larger than
+# <max> breaks between lines with both headers repeated, so no pass sees a change
+# without the file and hunk it belongs to.
+split_overflow() { # split_overflow <max-bytes> <dir> <tag>
+  LC_ALL=C awk -v max="$1" -v dir="$2" -v tag="$3" '
+    function emit(text) { # starts a new part when text does not fit the current one
+      if (used && used + length(text) > max) { close(f); n++; used = 0 }
+      f = dir "/part" n "." tag; printf "%s", text > f; used += length(text)
+    }
+    function flush(   whole, cur, k, m, q, hl, hh, chunk) {
+      if (head == "") return
+      whole = head
+      for (k = 1; k <= nh; k++) whole = whole hunk[k]
+      if (length(whole) <= max) { emit(whole); head = ""; nh = 0; return }
+      cur = head
+      for (k = 1; k <= nh; k++) {
+        if (length(head) + length(hunk[k]) <= max) {
+          if (length(cur) + length(hunk[k]) > max) { emit(cur); cur = head }
+          cur = cur hunk[k]
+          continue
+        }
+        # A hunk larger than the budget: line by line under both headers.
+        if (cur != head) { emit(cur); cur = head }
+        m = split(hunk[k], hl, "\n"); hh = hl[1] "\n"; chunk = head hh
+        for (q = 2; q < m; q++) {
+          if (length(chunk) + length(hl[q]) + 1 > max && chunk != head hh) { emit(chunk); chunk = head hh }
+          chunk = chunk hl[q] "\n"
+        }
+        emit(chunk)
+      }
+      if (cur != head) emit(cur)
+      head = ""; nh = 0
+    }
+    BEGIN { n = 1 }
+    /^diff --git / { flush(); head = $0 "\n"; inhead = 1; next }
+    inhead && /^@@/ { inhead = 0 }
+    inhead { head = head $0 "\n"; next }
+    /^@@/ { hunk[++nh] = $0 "\n"; next }
+    { hunk[nh] = hunk[nh] $0 "\n" }
+    END { flush() }'
+}
+
 review_pr() { # review_pr <repo> <number> <runner-login> [check]
   local repo="$1" number="$2" runner="$3" mode="${4:-}"
   local REVIEW_MODEL="$CODEX_MODEL"
   [[ $REVIEW_BACKEND == claude ]] && REVIEW_MODEL="$CLAUDE_MODEL"
   local head_sha comments threads reviews replies newest dir persona pc body_text
   local -a parts
-  local prior url out verdict body stripped report_ref cleared=0 lines="" truncated="" omitted omitted_source="" incomplete="" extra i k passed rc=0 repo_json
+  local prior url out verdict body stripped report_ref cleared=0 lines="" truncated="" omitted omitted_source="" incomplete="" extra i k passed changed rc=0 repo_json
   local t0 meta updated age fp base_sha advisory=""
   local summary_signatures=""
   # Fixed once: background reviews share $$, and $BASHPID changes inside $(...).
@@ -738,11 +782,10 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
   # each within the budget, so deletions and removed lines are seen too.
   parts=("$WORK_DIR/diff.$tag")
   incomplete=""
+  changed=$(grep '^diff --git ' "$WORK_DIR/diff.full.$tag" | cut -c12-)
   if [[ -n $omitted_source ]]; then
     fit_diff "$MAX_DIFF_BYTES" "$GENERATED_PATHS" overflow <"$WORK_DIR/diff.full.$tag" |
-      LC_ALL=C awk -v max="$MAX_DIFF_BYTES" -v dir="$WORK_DIR" -v tag="$tag" \
-        'BEGIN { n = 1 } { l = length($0) + 1; if (used && used + l > max) { close(f); n++; used = 0 }
-          f = dir "/part" n "." tag; print > f; used += l }' || return 1
+      split_overflow "$MAX_DIFF_BYTES" "$WORK_DIR" "$tag" || return 1
     # Named *.$tag so the RETURN trap that clears this review's scratch removes them.
     extra=$(find "$WORK_DIR" -maxdepth 1 -name "part*.$tag" | wc -l)
     if [[ $extra -le $MAX_REVIEW_PASSES ]]; then
@@ -790,7 +833,8 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
         elif [[ $k -eq 0 ]]; then
           printf '\nDiff, pass 1 of %s: every change that fits. Source changes that did not fit are reviewed in the other passes.\n' "${#parts[@]}"
         else
-          printf '\nDiff, pass %s of %s: only source changes that did not fit in pass 1. The rest of the pull request is reviewed separately; read the checkout for context.\n' \
+          printf '\nEvery file this pull request changes, for context (read them in the checkout as needed):\n%s\n' "$changed"
+          printf '\nDiff, pass %s of %s: only source changes that did not fit in pass 1. A file too large for one pass continues in the next, with its header repeated. The rest of the pull request is reviewed separately.\n' \
             "$((k + 1))" "${#parts[@]}"
         fi
         cat "${parts[$k]}"

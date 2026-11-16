@@ -1096,6 +1096,7 @@ REVIEW_BACKEND=claude MAX_DIFF_BYTES=600 MAX_REVIEW_PASSES=5
 OVER_OUT=$(review_pr yoshi/alpha 9 yoshi 2>/dev/null)
 eq "an oversized source file gets its own pass" 2 "$(grep -c '^Invoke the security-audit' "$STUB_CLAUDE_LOG")"
 contains "the second pass is labelled" "$(cat "$STUB_CLAUDE_LOG")" 'Diff, pass 2 of 2'
+contains "every extra pass lists the changed files" "$(cat "$STUB_CLAUDE_LOG")" 'a/src/auth.go b/src/auth.go'
 contains "a deleted file's patch reaches the reviewer" "$(cat "$STUB_CLAUDE_LOG")" '+++ /dev/null'
 contains "its removed lines reach the reviewer" "$(cat "$STUB_CLAUDE_LOG")" '-zzzz'
 contains "every pass cleared, so the review clears" "$OVER_OUT" 'verdict=cleared'
@@ -1104,7 +1105,8 @@ MAX_DIFF_BYTES=300
 : >"$STUB_CLAUDE_LOG"
 SPLIT_OUT=$(review_pr yoshi/alpha 9 yoshi 2>/dev/null)
 contains "a bundle left out is listed as not reviewed" "$SPLIT_OUT" 'Generated, not reviewed (CI must rebuild them from source and compare): `web/dist/b.js`'
-eq "a patch larger than the budget is split, never cut" 3 "$(grep -c '^Invoke the security-audit' "$STUB_CLAUDE_LOG")"
+eq "a line longer than the budget travels whole in one extra pass" 2 "$(grep -c '^Invoke the security-audit' "$STUB_CLAUDE_LOG")"
+contains "the oversized line keeps its file header" "$(cat "$STUB_CLAUDE_LOG")" $'deleted file mode 100644\n--- a/src/auth.go\n+++ /dev/null\n@@ -1 +0,0 @@\n-zzzz'
 MAX_DIFF_BYTES=600
 
 : >"$STUB_CLAUDE_LOG"
@@ -1117,6 +1119,23 @@ REVIEW_BACKEND=$SAVED_BACKEND MAX_DIFF_BYTES=$SAVED_MAX MAX_REVIEW_PASSES=$SAVED
 export STUB_HEAD_SHA=$SAVED_HEAD STUB_COMMENTS_FILE=$SAVED_COMMENTS STUB_REPO_JSON=$SAVED_REPO
 mv "$STUB/claude.saved" "$STUB/bin/claude"
 unset STUB_DIFF_FILE
+
+# --- split_overflow: parts break between files and hunks, never without headers ---
+SPLIT_DIR=$(mktemp -d)
+{ printf 'diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n'
+  for h in 1 2 3; do printf '@@ -%s,1 +%s,1 @@ func f%s\n' "$h" "$h" "$h"; for l in 1 2 3 4 5; do printf '+line %s of hunk %s xxxxxxxxxxxxxxxxxxxx\n' "$l" "$h"; done; done
+  printf 'diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1 @@\n+small\n'; } >"$SPLIT_DIR/in"
+split_overflow 260 "$SPLIT_DIR" t <"$SPLIT_DIR/in"
+SPLIT_BAD=0
+for part in "$SPLIT_DIR"/part*.t; do
+  [[ $(head -1 "$part") == 'diff --git a/a.go b/a.go' ]] || SPLIT_BAD=1
+  [[ $(sed -n 4p "$part") == @@* ]] || SPLIT_BAD=1
+done
+eq "every part opens with its file header and hunk header" 0 "$SPLIT_BAD"
+eq "no changed line is lost or repeated across parts" 16 "$(cat "$SPLIT_DIR"/part*.t | grep -c '^+line\|^+small')"
+eq "a line is never split" 0 "$(cat "$SPLIT_DIR"/part*.t | grep -c '^x')"
+contains "a small file rides along whole" "$(cat "$SPLIT_DIR"/part*.t)" $'diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1 @@\n+small'
+rm -rf "$SPLIT_DIR"
 
 # pr-agent runs beside the security review, and the review waits for it.
 eval "real_$(declare -f run_persona)"

@@ -91,7 +91,9 @@
 - `fit_diff` fills `MAX_DIFF_BYTES` whole files at a time, source before
   `GENERATED_PATHS` output. Source that does not fit is reviewed from its own
   patches in extra passes of the same persona (up to `MAX_REVIEW_PASSES`), so
-  deletions and removed lines are seen; the verdict clears only if every pass
+  deletions and removed lines are seen. `split_overflow` breaks passes only
+  between files or hunks and repeats the file and hunk headers, and every extra
+  pass gets the full changed-file list; the verdict clears only if every pass
   clears and no source was left unread. Generated files left out are listed as
   not reviewed, never as reviewed.
 
