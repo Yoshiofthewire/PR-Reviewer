@@ -1429,6 +1429,16 @@ QD=$(mkdiff web/dist/big.js 400; printf 'diff --git "a/src/evil\\tname.go" "b/sr
 eq "a quoted path starts its own section as source" $'source\t"a/src/evil\\tname.go" "b/src/evil\\tname.go"\ngenerated\tweb/dist/big.js' \
   "$(fit_diff 100 "$GEN" omitted <<<"$QD")"
 contains "a quoted source file is kept ahead of a bundle" "$(fit_diff 500 "$GEN" diff <<<"$QD")" 'evil\tname.go'
+eq "a name hiding \" b/\" is not split into a bundle" $'source\tdist/a.js b/evil.go' \
+  "$(fit_diff 10 "$GEN" omitted <<<"$(mkdiff 'dist/a.js b/evil.go' 50)")"
+eq "a rename is never generated" $'source\ta/src/x.go b/web/dist/x.js' \
+  "$(fit_diff 10 "$GEN" omitted <<<$'diff --git a/src/x.go b/web/dist/x.js\nsimilarity index 90%\n')"
+eq "a bundle renamed by its hash is generated" $'generated\tweb/dist/b-2.js' \
+  "$(fit_diff 10 "$GEN" omitted <<<$'diff --git a/web/dist/b-1.js b/web/dist/b-2.js\nsimilarity index 90%\nrename from web/dist/b-1.js\nrename to web/dist/b-2.js\n')"
+eq "a rename out of source is never generated" $'source\ta/src/x.go b/web/dist/x.js' \
+  "$(fit_diff 10 "$GEN" omitted <<<$'diff --git a/src/x.go b/web/dist/x.js\nsimilarity index 90%\nrename from src/x.go\nrename to web/dist/x.js\n')"
+eq "rename lines inside a hunk are content, not metadata" $'source\ta/src/x.go b/src/y.go' \
+  "$(fit_diff 10 "$GEN" omitted <<<$'diff --git a/src/x.go b/src/y.go\n@@ -1 +1 @@\nrename from dist/a.js\nrename to dist/b.js\n')"
 eq "code under dist/ is still source" $'source\tdist/x.go' "$(fit_diff 10 "$GEN" omitted <<<"$(mkdiff dist/x.go 50)")"
 lacks "a backtick in a name cannot close the code span" "$(omission_note $'source\tsrc/a`b.go')" 'a`b'
 contains "the name survives without its backtick" "$(omission_note $'source\tsrc/a`b.go')" '`src/ab.go`'
