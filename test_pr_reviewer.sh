@@ -1115,6 +1115,13 @@ CAP_OUT=$(review_pr yoshi/alpha 9 yoshi 2>/dev/null)
 eq "past the pass cap no extra pass runs" 1 "$(grep -c '^Invoke the security-audit' "$STUB_CLAUDE_LOG")"
 contains "unread source blocks clearance" "$CAP_OUT" 'verdict=open'
 contains "the note says the source was not reviewed" "$CAP_OUT" 'Source, NOT reviewed'
+MAX_REVIEW_PASSES=5
+eval "real_$(declare -f split_overflow)"
+eval 'split_overflow() { cat >/dev/null; }'
+LOST_OUT=$(review_pr yoshi/alpha 9 yoshi 2>/dev/null)
+contains "a left-out file that reaches no pass blocks clearance" "$LOST_OUT" 'verdict=open'
+contains "and it is reported as not reviewed" "$LOST_OUT" 'Source, NOT reviewed'
+eval "$(declare -f real_split_overflow | sed '1s/real_//')"
 REVIEW_BACKEND=$SAVED_BACKEND MAX_DIFF_BYTES=$SAVED_MAX MAX_REVIEW_PASSES=$SAVED_PASSES DRY_RUN=$SAVED_DRY
 export STUB_HEAD_SHA=$SAVED_HEAD STUB_COMMENTS_FILE=$SAVED_COMMENTS STUB_REPO_JSON=$SAVED_REPO
 mv "$STUB/claude.saved" "$STUB/bin/claude"
@@ -1135,6 +1142,10 @@ eq "every part opens with its file header and hunk header" 0 "$SPLIT_BAD"
 eq "no changed line is lost or repeated across parts" 16 "$(cat "$SPLIT_DIR"/part*.t | grep -c '^+line\|^+small')"
 eq "a line is never split" 0 "$(cat "$SPLIT_DIR"/part*.t | grep -c '^x')"
 contains "a small file rides along whole" "$(cat "$SPLIT_DIR"/part*.t)" $'diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1 @@\n+small'
+LONGNAME="src/$(head -c 300 /dev/zero | tr '\0' n).go"
+printf 'diff --git a/%s b/%s.go\nsimilarity index 100%%\nrename from %s\nrename to %s.go\n' "$LONGNAME" "$LONGNAME" "$LONGNAME" "$LONGNAME" >"$SPLIT_DIR/rename"
+split_overflow 200 "$SPLIT_DIR" r <"$SPLIT_DIR/rename"
+eq "a change with no hunks over the budget still reaches a pass" "$(cat "$SPLIT_DIR/rename")" "$(cat "$SPLIT_DIR"/part*.r 2>/dev/null)"
 rm -rf "$SPLIT_DIR"
 
 # pr-agent runs beside the security review, and the review waits for it.

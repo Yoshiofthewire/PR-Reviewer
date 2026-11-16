@@ -629,7 +629,8 @@ split_overflow() { # split_overflow <max-bytes> <dir> <tag>
       if (head == "") return
       whole = head
       for (k = 1; k <= nh; k++) whole = whole hunk[k]
-      if (length(whole) <= max) { emit(whole); head = ""; nh = 0; return }
+      # Small files, and changes with no hunks (renames, mode changes), go whole.
+      if (length(whole) <= max || nh == 0) { emit(whole); head = ""; nh = 0; return }
       cur = head
       for (k = 1; k <= nh; k++) {
         if (length(head) + length(hunk[k]) <= max) {
@@ -788,14 +789,18 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
       split_overflow "$MAX_DIFF_BYTES" "$WORK_DIR" "$tag" || return 1
     # Named *.$tag so the RETURN trap that clears this review's scratch removes them.
     extra=$(find "$WORK_DIR" -maxdepth 1 -name "part*.$tag" | wc -l)
-    if [[ $extra -le $MAX_REVIEW_PASSES ]]; then
+    # Every left-out source file must reach a pass, or the review cannot clear.
+    if [[ -n $(fit_diff "$MAX_DIFF_BYTES" "$GENERATED_PATHS" overflow <"$WORK_DIR/diff.full.$tag" |
+      grep '^diff --git ' | grep -vxF -f <(cat "$WORK_DIR"/part*."$tag" 2>/dev/null | grep '^diff --git ')) ]]; then
+      incomplete=1
+    elif [[ $extra -le $MAX_REVIEW_PASSES ]]; then
       for ((i = 1; i <= extra; i++)); do parts+=("$WORK_DIR/part$i.$tag"); done
     else
       incomplete=1
     fi
   fi
   if [[ -n $incomplete ]]; then
-    truncated=$(omission_note "$omitted" "Source, NOT reviewed: more than MAX_REVIEW_PASSES ($MAX_REVIEW_PASSES) extra passes needed, so this review cannot clear; split the pull request")
+    truncated=$(omission_note "$omitted" "Source, NOT reviewed: it does not fit in MAX_REVIEW_PASSES ($MAX_REVIEW_PASSES) extra passes, so this review cannot clear; split the pull request")
   else
     truncated=$(omission_note "$omitted" "Source, reviewed from its full patch in $((${#parts[@]} - 1)) extra pass(es)")
   fi
