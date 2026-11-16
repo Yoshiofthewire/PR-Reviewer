@@ -23,6 +23,8 @@ source "$SCRIPT_DIR/lib/review-core.sh"
 
 MAX_PRS_PER_TICK="${MAX_PRS_PER_TICK:-5}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-180000}"
+# Built output the size budget drops first. Brackets, not backslashes: awk -v eats escapes.
+GENERATED_PATHS="${GENERATED_PATHS:-(^|/)dist/|[.]min[.](js|css)$|[.]map$}"
 REVIEW_BACKEND="${REVIEW_BACKEND:-codex}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-6.1-sol}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-claude-opus-5-5}"
@@ -615,7 +617,7 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
   local REVIEW_MODEL="$CODEX_MODEL"
   [[ $REVIEW_BACKEND == claude ]] && REVIEW_MODEL="$CLAUDE_MODEL"
   local head_sha comments threads reviews replies newest dir persona pc body_text
-  local prior url out verdict body stripped report_ref cleared=0 lines="" truncated="" rc=0 repo_json
+  local prior url out verdict body stripped report_ref cleared=0 lines="" truncated="" omitted omitted_source="" rc=0 repo_json
   local t0 meta updated age fp base_sha advisory=""
   local summary_signatures=""
   # Fixed once: background reviews share $$, and $BASHPID changes inside $(...).
@@ -724,9 +726,12 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
   # Scratch files live beside the checkout, never inside it.
   gh api "repos/$repo/compare/$base_sha...$head_sha" -H 'Accept: application/vnd.github.diff' \
     >"$WORK_DIR/diff.full.$tag" || return 1
-  head -c "$MAX_DIFF_BYTES" "$WORK_DIR/diff.full.$tag" >"$WORK_DIR/diff.$tag" || return 1
-  [[ $(wc -c <"$WORK_DIR/diff.full.$tag") -gt $MAX_DIFF_BYTES ]] &&
-    truncated=$'\n\n> Review input was truncated; omitted changes were not reviewed.'
+  fit_diff "$MAX_DIFF_BYTES" "$GENERATED_PATHS" diff <"$WORK_DIR/diff.full.$tag" \
+    >"$WORK_DIR/diff.$tag" || return 1
+  omitted=$(fit_diff "$MAX_DIFF_BYTES" "$GENERATED_PATHS" omitted <"$WORK_DIR/diff.full.$tag") ||
+    return 1
+  truncated=$(omission_note "$omitted")
+  omitted_source=$(awk -F'\t' '$1 == "source" { print $2 }' <<<"$omitted")
 
   # pr-agent runs beside the personas so its advice lands with the verdict.
   # Public repositories are opt-in: its comment is published unredacted.
@@ -749,8 +754,11 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
     {
       build_persona_task "$persona" "$prior" \
         "$(reply_bodies "$replies" "$(state_field "$prior" seen)" "$runner")"
-      printf '\nDiff (possibly truncated):\n'
+      printf '\nDiff:\n'
       cat "$WORK_DIR/diff.$tag"
+      [[ -z $omitted_source ]] ||
+        printf '\nThese changed files did not fit in the diff above. Read each one in the checkout at this head and review its changes as part of this pull request:\n%s\n' \
+          "$omitted_source"
     } >"$WORK_DIR/prompt.$tag"
 
     # Each persona is a multi-minute model call. Announce it before blocking, or

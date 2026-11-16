@@ -123,7 +123,8 @@ gateway key is in the environment of the model CLIs and is not hidden from them.
 | `REVIEW_JOBS` | 3 | Reviews run at once |
 | `SETTLE_SECONDS` | 300 | Quiet time after the last push, comment, or review before a pull request is reviewed |
 | `GH_PAUSE` | 60 | Base pause in seconds before retrying a rate-limited GitHub call (×attempt, up to five attempts; waits for the reset when the hourly quota is spent) |
-| `MAX_DIFF_BYTES` | 180000 | Diff truncation threshold in bytes; truncation is stated in the comment |
+| `MAX_DIFF_BYTES` | 180000 | Diff budget in bytes, filled whole files at a time with source first. Source files that do not fit are named in the prompt for the reviewer to read from the checkout; the comment lists every file left out |
+| `GENERATED_PATHS` | `(^\|/)dist/\|[.]min[.](js\|css)$\|[.]map$` | awk regex for built output, dropped before any source file when the diff is over budget and listed as not reviewed. Use brackets, not backslashes |
 | `DRY_RUN` | unset | Print comment bodies instead of posting them |
 | `HANDOFF_URL` | empty | Hand-off board base URL; unset means deliver full findings to a local file instead |
 | `HANDOFF_TOKEN` | empty | Bearer token for that board; both must be set for board delivery |

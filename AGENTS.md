@@ -87,7 +87,11 @@
 - Ticks must be idempotent. Reap stale checkouts rather than assuming the last
   run finished.
 - Never silently truncate. A capped tick logs what it deferred; a truncated diff
-  says so in the comment.
+  says so in the comment and names every file left out.
+- `fit_diff` fills `MAX_DIFF_BYTES` whole files at a time, source before
+  `GENERATED_PATHS` output. A source file that does not fit is named in the
+  prompt for the persona to read from the checkout; generated files left out are
+  listed as not reviewed, never as reviewed.
 
 ## Verification
 

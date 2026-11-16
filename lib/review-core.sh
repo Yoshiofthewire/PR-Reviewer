@@ -150,3 +150,49 @@ repo_filter_reason() { # repo_filter_reason <repo>
   esac
   printf 'not in REPOSITORIES allowlist'
 }
+
+# Fit a unified diff (stdin) into <max-bytes> whole files at a time: source files
+# first in diff order, then files whose path matches <generated-regex>, so built
+# bundles are what get left out. Mode "diff" prints the fitted diff; "omitted"
+# prints "<source|generated>\t<path>" for each file left out.
+fit_diff() { # fit_diff <max-bytes> <generated-regex> <diff|omitted>
+  LC_ALL=C awk -v max="$1" -v gen="$2" -v mode="$3" '
+    /^diff --git a\// {
+      if (n) body[n] = cur
+      n++; cur = $0 "\n"
+      p = $0; sub(/^diff --git a\//, "", p); sub(/ b\/.*$/, "", p)
+      path[n] = p; isgen[n] = (gen != "" && p ~ gen)
+      next
+    }
+    { if (n) cur = cur $0 "\n"; else pre = pre $0 "\n" }
+    END {
+      if (n) body[n] = cur
+      used = length(pre); out = pre
+      for (pass = 0; pass < 2; pass++)
+        for (i = 1; i <= n; i++) if (isgen[i] == pass) {
+          if (used + length(body[i]) <= max) { out = out body[i]; used += length(body[i]) }
+          else left = left (pass ? "generated" : "source") "\t" path[i] "\n"
+        }
+      printf "%s", (mode == "diff" ? out : left)
+    }'
+}
+
+# The comment note for files fit_diff left out; empty when nothing was.
+omission_note() { # omission_note <fit_diff omitted output>
+  local kind label names
+  [[ -n $1 ]] || return 0
+  printf '\n\n> Review input was truncated to stay under the size limit; changes to %s file(s) were left out of the diff.' \
+    "$(grep -c '' <<<"$1")"
+  for kind in source generated; do
+    names=$(awk -F'\t' -v k="$kind" '$1 == k { if (c++ < 20) printf "%s`%s`", (c > 1 ? ", " : ""), $2 }
+      END { if (c > 20) printf ", and %d more", c - 20 }' <<<"$1")
+    [[ -n $names ]] || continue
+    if [[ $kind == source ]]; then
+      label='Source, reviewed from the checkout instead of the diff'
+    else
+      label='Generated, not reviewed (CI must rebuild them from source and compare)'
+    fi
+    printf '\n> - %s: %s' "$label" "$names"
+  done
+  printf '\n'
+}

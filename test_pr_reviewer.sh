@@ -1401,5 +1401,39 @@ STATUS_DIR=""
 log_pr check 'yoshi/alpha#8' 'unrecorded' 2>/dev/null
 eq "no STATUS_DIR, no feed" 1 "$(lines_of "$(cat "$STUB/status/events.jsonl")")"
 
+# --- fit_diff: source first, generated bundles dropped first, whole files only ---
+GEN='(^|/)dist/|[.]min[.](js|css)$|[.]map$'
+mkdiff() { # mkdiff <path> <payload-bytes>
+  printf 'diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -0,0 +1 @@\n+%s\n' "$1" "$1" "$1" "$1" "$(head -c "$2" /dev/zero | tr '\0' x)"
+}
+FD=$(mkdiff web/dist/index-abc.js 400; mkdiff web/src/App.tsx 100; mkdiff app.min.js 50; mkdiff internal/api/server.go 100)
+eq "a diff that fits keeps every file" 4 "$(fit_diff 100000 "$GEN" diff <<<"$FD" | grep -c '^diff --git')"
+eq "a diff that fits keeps every byte" "$(wc -c <<<"$FD")" "$(fit_diff 100000 "$GEN" diff <<<"$FD" | wc -c)"
+eq "a diff that fits omits nothing" '' "$(fit_diff 100000 "$GEN" omitted <<<"$FD")"
+# Sections: dist 531, App.tsx 207, app.min.js 137, server.go 235 bytes.
+FIT=$(fit_diff 600 "$GEN" diff <<<"$FD")
+contains "source survives a tight budget" "$FIT" 'diff --git a/web/src/App.tsx'
+contains "later source still survives" "$FIT" 'diff --git a/internal/api/server.go'
+lacks "the big bundle is dropped" "$FIT" 'web/dist/index-abc.js'
+eq "source keeps diff order ahead of generated" 'web/src/App.tsx internal/api/server.go app.min.js' \
+  "$(grep -o '^diff --git a/[^ ]*' <<<"$FIT" | sed 's|diff --git a/||' | paste -sd' ')"
+eq "omitted lists the dropped bundle as generated" $'generated\tweb/dist/index-abc.js' "$(fit_diff 600 "$GEN" omitted <<<"$FD")"
+eq "an oversized source file is listed as source" $'source\tweb/src/App.tsx\nsource\tinternal/api/server.go\ngenerated\tweb/dist/index-abc.js\ngenerated\tapp.min.js' \
+  "$(fit_diff 100 "$GEN" omitted <<<"$FD")"
+lacks "no file is cut mid-hunk" "$(fit_diff 300 "$GEN" diff <<<"$FD")" 'web/dist'
+eq "spaces in a path survive" $'generated\tdist/a b.js' "$(fit_diff 10 "$GEN" omitted <<<"$(mkdiff 'dist/a b.js' 50)")"
+eq "an empty generated pattern keeps plain diff order" $'source\tweb/src/App.tsx\nsource\tapp.min.js\nsource\tinternal/api/server.go' \
+  "$(fit_diff 600 '' omitted <<<"$FD")"
+
+eq "nothing omitted, no note" '' "$(omission_note '')"
+NOTE=$(omission_note "$(fit_diff 100 "$GEN" omitted <<<"$FD")")
+contains "the note still says truncated" "$NOTE" 'Review input was truncated'
+contains "the note counts files" "$NOTE" 'changes to 4 file(s)'
+contains "source is named as read from the checkout" "$NOTE" 'reviewed from the checkout instead of the diff: `web/src/App.tsx`, `internal/api/server.go`'
+contains "generated is named as not reviewed" "$NOTE" 'Generated, not reviewed (CI must rebuild them from source and compare): `web/dist/index-abc.js`, `app.min.js`'
+MANY=$(for i in $(seq 1 25); do printf 'generated\tdist/f%s.js\n' "$i"; done)
+contains "long lists are capped" "$(omission_note "$MANY")" ', and 5 more'
+lacks "the cap hides the 21st name" "$(omission_note "$MANY")" 'dist/f21.js'
+
 [[ $fails -eq 0 ]] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"
