@@ -99,11 +99,13 @@ count_token='cat /proc/[0-9]*/environ "$1"/* 2>/dev/null | grep -acF -f /dev/fd/
 if [[ -n ${HIDE_FROM_MODELS:-} ]]; then
   token=$(command gh auth token) && [[ -n $token ]] || exit 1
   seen=$(bash -c "$count_token" _ "$HIDE_FROM_MODELS" 3<<<"$token")
-  [[ $seen =~ ^[1-9][0-9]*$ ]]; report 'control: the search finds the token outside the jail' $?
+  ok=1; [[ $seen =~ ^[1-9][0-9]*$ ]] && ok=0
+  report 'control: the search finds the token outside the jail' "$ok"
   # shellcheck disable=SC2154  # model_jail comes from pr-reviewer.sh
   seen=$("${model_jail[@]}" bash -c "$count_token" _ "$HIDE_FROM_MODELS" 3<<<"$token")
   # Anything but a literal 0 fails, including a jail that never started.
-  [[ $seen == 0 ]]; report 'model jail hides the GitHub token (login directory and every environment)' $?
+  ok=1; [[ $seen == 0 ]] && ok=0
+  report 'model jail hides the GitHub token (login directory and every environment)' "$ok"
 fi
 
 [[ $fails -eq 0 ]] || { echo "$fails isolation check(s) failed" >&2; exit 1; }
