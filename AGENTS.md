@@ -89,9 +89,11 @@
 - Never silently truncate. A capped tick logs what it deferred; a truncated diff
   says so in the comment and names every file left out.
 - `fit_diff` fills `MAX_DIFF_BYTES` whole files at a time, source before
-  `GENERATED_PATHS` output. A source file that does not fit is named in the
-  prompt for the persona to read from the checkout; generated files left out are
-  listed as not reviewed, never as reviewed.
+  `GENERATED_PATHS` output. Source that does not fit is reviewed from its own
+  patches in extra passes of the same persona (up to `MAX_REVIEW_PASSES`), so
+  deletions and removed lines are seen; the verdict clears only if every pass
+  clears and no source was left unread. Generated files left out are listed as
+  not reviewed, never as reviewed.
 
 ## Verification
 

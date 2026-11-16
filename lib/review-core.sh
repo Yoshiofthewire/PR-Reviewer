@@ -154,8 +154,9 @@ repo_filter_reason() { # repo_filter_reason <repo>
 # Fit a unified diff (stdin) into <max-bytes> whole files at a time: source files
 # first in diff order, then files whose path matches <generated-regex>, so built
 # bundles are what get left out. Mode "diff" prints the fitted diff; "omitted"
-# prints "<source|generated>\t<path>" for each file left out.
-fit_diff() { # fit_diff <max-bytes> <generated-regex> <diff|omitted>
+# prints "<source|generated>\t<path>" for each file left out; "overflow" prints
+# the full patches of the source files left out, for the extra review passes.
+fit_diff() { # fit_diff <max-bytes> <generated-regex> <diff|omitted|overflow>
   LC_ALL=C awk -v max="$1" -v gen="$2" -v mode="$3" '
     function close_section() {
       if (!n) return
@@ -186,14 +187,17 @@ fit_diff() { # fit_diff <max-bytes> <generated-regex> <diff|omitted>
       for (pass = 0; pass < 2; pass++)
         for (i = 1; i <= n; i++) if (isgen[i] == pass) {
           if (used + length(body[i]) <= max) { out = out body[i]; used += length(body[i]) }
-          else left = left (pass ? "generated" : "source") "\t" path[i] "\n"
+          else {
+            left = left (pass ? "generated" : "source") "\t" path[i] "\n"
+            if (!pass) over = over body[i]
+          }
         }
-      printf "%s", (mode == "diff" ? out : left)
+      printf "%s", (mode == "diff" ? out : mode == "overflow" ? over : left)
     }'
 }
 
 # The comment note for files fit_diff left out; empty when nothing was.
-omission_note() { # omission_note <fit_diff omitted output>
+omission_note() { # omission_note <fit_diff omitted output> <label for source files>
   local kind label names
   [[ -n $1 ]] || return 0
   printf '\n\n> Review input was truncated to stay under the size limit; changes to %s file(s) were left out of the diff.' \
@@ -204,7 +208,7 @@ omission_note() { # omission_note <fit_diff omitted output>
       END { if (c > 20) printf ", and %d more", c - 20 }' <<<"$1")
     [[ -n $names ]] || continue
     if [[ $kind == source ]]; then
-      label='Source, reviewed from the checkout instead of the diff'
+      label=$2
     else
       label='Generated, not reviewed (CI must rebuild them from source and compare)'
     fi

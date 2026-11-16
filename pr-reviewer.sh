@@ -24,6 +24,8 @@ source "$SCRIPT_DIR/lib/review-core.sh"
 MAX_PRS_PER_TICK="${MAX_PRS_PER_TICK:-5}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-180000}"
 # Built output the size budget drops first. Brackets, not backslashes: awk -v eats escapes.
+# Extra passes for source that does not fit; past this the review cannot clear.
+MAX_REVIEW_PASSES="${MAX_REVIEW_PASSES:-5}"
 GENERATED_PATHS="${GENERATED_PATHS:-(^|/)dist/.*[.](js|css|html|map)$|[.]min[.](js|css)$|[.]map$}"
 REVIEW_BACKEND="${REVIEW_BACKEND:-codex}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-6.1-sol}"
@@ -617,7 +619,8 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
   local REVIEW_MODEL="$CODEX_MODEL"
   [[ $REVIEW_BACKEND == claude ]] && REVIEW_MODEL="$CLAUDE_MODEL"
   local head_sha comments threads reviews replies newest dir persona pc body_text
-  local prior url out verdict body stripped report_ref cleared=0 lines="" truncated="" omitted omitted_source="" rc=0 repo_json
+  local -a parts
+  local prior url out verdict body stripped report_ref cleared=0 lines="" truncated="" omitted omitted_source="" incomplete="" extra i k passed rc=0 repo_json
   local t0 meta updated age fp base_sha advisory=""
   local summary_signatures=""
   # Fixed once: background reviews share $$, and $BASHPID changes inside $(...).
@@ -730,8 +733,29 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
     >"$WORK_DIR/diff.$tag" || return 1
   omitted=$(fit_diff "$MAX_DIFF_BYTES" "$GENERATED_PATHS" omitted <"$WORK_DIR/diff.full.$tag") ||
     return 1
-  truncated=$(omission_note "$omitted")
   omitted_source=$(awk -F'\t' '$1 == "source" { print $2 }' <<<"$omitted")
+  # Source that did not fit is reviewed from its own patches in further passes,
+  # each within the budget, so deletions and removed lines are seen too.
+  parts=("$WORK_DIR/diff.$tag")
+  incomplete=""
+  if [[ -n $omitted_source ]]; then
+    fit_diff "$MAX_DIFF_BYTES" "$GENERATED_PATHS" overflow <"$WORK_DIR/diff.full.$tag" |
+      LC_ALL=C awk -v max="$MAX_DIFF_BYTES" -v dir="$WORK_DIR" -v tag="$tag" \
+        'BEGIN { n = 1 } { l = length($0) + 1; if (used && used + l > max) { close(f); n++; used = 0 }
+          f = dir "/part" n "." tag; print > f; used += l }' || return 1
+    # Named *.$tag so the RETURN trap that clears this review's scratch removes them.
+    extra=$(find "$WORK_DIR" -maxdepth 1 -name "part*.$tag" | wc -l)
+    if [[ $extra -le $MAX_REVIEW_PASSES ]]; then
+      for ((i = 1; i <= extra; i++)); do parts+=("$WORK_DIR/part$i.$tag"); done
+    else
+      incomplete=1
+    fi
+  fi
+  if [[ -n $incomplete ]]; then
+    truncated=$(omission_note "$omitted" "Source, NOT reviewed: more than MAX_REVIEW_PASSES ($MAX_REVIEW_PASSES) extra passes needed, so this review cannot clear; split the pull request")
+  else
+    truncated=$(omission_note "$omitted" "Source, reviewed from its full patch in $((${#parts[@]} - 1)) extra pass(es)")
+  fi
 
   # pr-agent runs beside the personas so its advice lands with the verdict.
   # Public repositories are opt-in: its comment is published unredacted.
@@ -751,41 +775,46 @@ review_pr() { # review_pr <repo> <number> <runner-login> [check]
     pc=$(persona_comment "$comments" "$persona" "$runner")
     prior=$(jq -r '.body // ""' <<<"${pc:-null}")
     url=$(jq -r '.url // empty' <<<"${pc:-null}")
-    {
-      build_persona_task "$persona" "$prior" \
-        "$(reply_bodies "$replies" "$(state_field "$prior" seen)" "$runner")"
-      printf '\nDiff:\n'
-      cat "$WORK_DIR/diff.$tag"
-      [[ -z $omitted_source ]] ||
-        printf '\nThese changed files did not fit in the diff above. Read each one in the checkout at this head and review its changes as part of this pull request:\n%s\n' \
-          "$omitted_source"
-    } >"$WORK_DIR/prompt.$tag"
-
-    # Each persona is a multi-minute model call. Announce it before blocking, or
-    # the tick looks hung; report the elapsed time after, so slow ones are visible.
+    # Each persona is a multi-minute model call per pass. Announce it before
+    # blocking, or the tick looks hung; report the elapsed time after.
     t0=$SECONDS
     log_pr '' "$repo#$number" \
-      "$persona: running ${PERSONA_SKILL[$persona]} ($REVIEW_BACKEND/$REASONING_EFFORT)…"
-    # A failed run must not inherit the verdict seeded from the old comment: the
-    # summary would otherwise report it at the new head as if this head was reviewed.
-    run_persona "$persona" "$dir" "$WORK_DIR/prompt.$tag" >"$WORK_DIR/output.$tag" || {
+      "$persona: running ${PERSONA_SKILL[$persona]} ($REVIEW_BACKEND/$REASONING_EFFORT, ${#parts[@]} pass(es))…"
+    verdict=cleared stripped="" passed=1
+    for ((k = 0; k < ${#parts[@]}; k++)); do
+      {
+        build_persona_task "$persona" "$prior" \
+          "$(reply_bodies "$replies" "$(state_field "$prior" seen)" "$runner")"
+        if [[ ${#parts[@]} -eq 1 ]]; then
+          printf '\nDiff:\n'
+        elif [[ $k -eq 0 ]]; then
+          printf '\nDiff, pass 1 of %s: every change that fits. Source changes that did not fit are reviewed in the other passes.\n' "${#parts[@]}"
+        else
+          printf '\nDiff, pass %s of %s: only source changes that did not fit in pass 1. The rest of the pull request is reviewed separately; read the checkout for context.\n' \
+            "$((k + 1))" "${#parts[@]}"
+        fi
+        cat "${parts[$k]}"
+      } >"$WORK_DIR/prompt.$tag"
+      # A failed pass must not inherit the verdict seeded from the old comment: the
+      # summary would otherwise report it at the new head as if this head was reviewed.
+      run_persona "$persona" "$dir" "$WORK_DIR/prompt.$tag" >"$WORK_DIR/output.$tag" || { passed=""; break; }
+      out=$(cat "$WORK_DIR/output.$tag")
+      [[ -n $out ]] || { passed=""; break; }
+      [[ $(parse_verdict "$out") == cleared ]] || verdict=open
+      [[ ${#parts[@]} -gt 1 ]] && stripped+=$'\n'"#### Pass $((k + 1)) of ${#parts[@]}"$'\n\n'
+      stripped+="$(strip_verdict "$out")"$'\n'
+    done
+    if [[ -z $passed ]]; then
       log_pr '' "$repo#$number" "$persona: FAILED after $((SECONDS - t0))s"
       VERDICTS[$persona]=failed
       rc=1
       continue
-    }
-    out=$(cat "$WORK_DIR/output.$tag")
-    [[ -n $out ]] || {
-      log_pr '' "$repo#$number" "$persona: empty output after $((SECONDS - t0))s"
-      VERDICTS[$persona]=failed
-      rc=1
-      continue
-    }
-    verdict=$(parse_verdict "$out")
+    fi
+    # Source left unreviewed means the change was not fully seen.
+    [[ -n $incomplete ]] && verdict=open
     log_pr '' "$repo#$number" "$persona: $verdict after $((SECONDS - t0))s"
     VERDICTS[$persona]=$verdict
     summary_signatures+="$(signature "$REVIEW_MODEL" "${PERSONA_SKILL[$persona]}")"$'\n'
-    stripped=$(strip_verdict "$out")
     if [[ $persona == security && $IS_PUBLIC == 1 ]]; then
       report_ref=$(deliver_full_finding "$repo" "$number" "$head_sha" "$verdict" "$stripped") ||
         rc=1
