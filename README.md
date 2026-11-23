@@ -130,7 +130,7 @@ gateway key is in the environment of the model CLIs and is not hidden from them.
 | `HANDOFF_URL` | empty | Hand-off board base URL; unset means deliver full findings to a local file instead |
 | `HANDOFF_TOKEN` | empty | Bearer token for that board; both must be set for board delivery |
 | `REVIEW_BACKEND` | `codex` | `codex` (Claude fallback) or `claude` (Claude only); `--backend codex\|claude` overrides it. For the timer, set it in `~/.config/pr-reviewer/env`, which overrides the unit |
-| `CODEX_MODEL` | `gpt-6.1-sol` | Primary review model |
+| `CODEX_MODEL` | `gpt-6.2-sol` | Primary review model |
 | `CLAUDE_MODEL` | `claude-opus-5-5` | Claude fallback model |
 | `SECURITY_SKILL_FILE` | `$CODEX_HOME/skills/security-audit/SKILL.md` (home defaults to `~/.codex`) | Trusted local skill supplied to Codex; install its companion files alongside it |
 | `REASONING_EFFORT` | `high` | Effort for every persona |

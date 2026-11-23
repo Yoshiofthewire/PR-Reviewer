@@ -243,7 +243,7 @@ PATH="$STUB/bin:$PATH"
 # shellcheck source=pr-reviewer.sh
 source ./pr-reviewer.sh
 eq "Codex is the default backend" codex "$REVIEW_BACKEND"
-eq "6.1 Sol is the default model" gpt-6.1-sol "$CODEX_MODEL"
+eq "6.2 Sol is the default model" gpt-6.2-sol "$CODEX_MODEL"
 parse_args --backend claude
 eq "--backend overrides the environment" claude "$REVIEW_BACKEND"
 eq "--backend claude signs as Claude" "$CLAUDE_MODEL" "$REVIEW_MODEL"
